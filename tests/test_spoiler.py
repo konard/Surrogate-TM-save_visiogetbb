@@ -27,6 +27,18 @@ SPOILER_HTML = """\
 </body>
 </html>"""
 
+# This is the exact HTML the live forum server sends — onclick uses &lt;/&gt; entities
+# which BeautifulSoup decodes to < > during parsing.  Without our fix str(soup)
+# would re-escape them back to &lt;/&gt;; with our formatter they survive as < >.
+SPOILER_HTML_FROM_SERVER = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div class="quotecontent"><span style="font-weight: bold"><span style="color: red">Содержимое спрятано под спойлер ↓</span></span><div style="padding: 3px; background-color: #FFFFFF; border: 1px solid #d8d8d8; font-size: 1em;"><div style="text-transform: uppercase; border-bottom: 1px solid #CCCCCC; margin-bottom: 3px; font-size: 0.8em; font-weight: bold; display: block;"><span onclick="if (this.parentNode.parentNode.getElementsByTagName('div')[1].getElementsByTagName('div')[0].style.display != '') {  this.parentNode.parentNode.getElementsByTagName('div')[1].getElementsByTagName('div')[0].style.display = ''; this.innerHTML = '&lt;b&gt;Спойлер: &lt;/b&gt;&lt;a href=\'#\' onClick=\'return false;\'&gt;↓&lt;/a&gt;'; } else { this.parentNode.parentNode.getElementsByTagName('div')[1].getElementsByTagName('div')[0].style.display = 'none'; this.innerHTML = '&lt;b&gt;Спойлер: &lt;/b&gt;&lt;a href=\'#\' onClick=\'return false;\'&gt;↕&lt;/a&gt;'; }"><b>Спойлер: </b><a href="#" onclick="return false;">↕</a></span></div>
+<div class="quotecontent"><div style="display: none;">spoiler content here</div></div></div></div>
+</body>
+</html>"""
+
 
 class TestSpoilerFormatter(unittest.TestCase):
     def test_formatter_preserves_angle_brackets_in_attributes(self):
@@ -69,6 +81,25 @@ class TestSpoilerFormatter(unittest.TestCase):
                       "process_page output must contain raw < in onclick innerHTML")
         self.assertNotIn("&lt;b&gt;Спойлер:", result,
                          "process_page must not escape onclick content to &lt;b&gt;")
+
+    def test_spoiler_onclick_entity_encoded_server_html(self):
+        """process_page must handle the actual server HTML where onclick uses &lt;/&gt; entities.
+
+        The live forum sends onclick attributes with &lt;b&gt; etc. inside innerHTML
+        assignments.  BeautifulSoup decodes those entities to < > during parsing; our
+        formatter must keep them as < > in the output, not re-escape them to &lt;/&gt;.
+        """
+        parser = ForumParser(output_dir="/tmp/test_parser_output")
+        parser.download_image = MagicMock(return_value=None)
+        parser.download_file = MagicMock(return_value=None)
+
+        url = "https://visio.getbb.ru/viewtopic.php?t=1"
+        result = parser.process_page(url, SPOILER_HTML_FROM_SERVER)
+
+        self.assertIn("this.innerHTML = '<b>Спойлер:", result,
+                      "onclick innerHTML must contain raw < after processing entity-encoded server HTML")
+        self.assertNotIn("&lt;b&gt;Спойлер:", result,
+                         "onclick must not have &lt;b&gt; after processing entity-encoded server HTML")
 
     def test_regular_content_ampersand_escaped(self):
         """Regular & in href attributes must still be escaped to &amp;."""
