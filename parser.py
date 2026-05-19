@@ -23,8 +23,16 @@ from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode
 
 import requests
 from bs4 import BeautifulSoup
+from bs4.formatter import HTMLFormatter
 
 BASE_URL = "https://visio.getbb.ru"
+
+# BeautifulSoup's default formatter escapes < and > inside attribute values (e.g. onclick),
+# which breaks spoiler expand/collapse handlers that use innerHTML with HTML markup.
+# This formatter only escapes & and " in attributes, preserving < and > for JavaScript.
+class _SpoilerSafeFormatter(HTMLFormatter):
+    def attribute_value(self, value: str) -> str:
+        return value.replace("&", "&amp;").replace('"', "&quot;")
 
 # URL patterns to skip entirely
 SKIP_PATTERNS = [
@@ -384,7 +392,7 @@ class ForumParser:
         for tag in soup.find_all(src=re.compile(r"sid=")):
             tag["src"] = re.sub(r"[?&]sid=[a-f0-9]+", "", tag["src"])
 
-        return str(soup)
+        return soup.decode(formatter=_SpoilerSafeFormatter())
 
     # ------------------------------------------------------------------
     # Page saving
