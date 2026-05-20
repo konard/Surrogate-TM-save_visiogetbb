@@ -34,6 +34,53 @@ class _SpoilerSafeFormatter(HTMLFormatter):
     def attribute_value(self, value: str) -> str:
         return value.replace("&", "&amp;").replace('"', "&quot;")
 
+
+def _fix_self_closing_spans(html: str) -> str:
+    """Convert self-closing <span .../> tags to regular open tags <span ...>.
+
+    The forum server sometimes emits <span onClick="..." /> (self-closing).
+    Browsers ignore the slash on non-void elements and treat the following
+    sibling nodes as children of the span.  BeautifulSoup's html.parser
+    honours the slash and creates an *empty* span instead, breaking the
+    spoiler onclick handler which relies on ``this`` containing the visible
+    label text.  Stripping the slash before parsing restores browser behaviour.
+    """
+    result: list[str] = []
+    i = 0
+    length = len(html)
+    while i < length:
+        # Look for the start of a <span tag (case-insensitive)
+        if html[i] == '<' and html[i+1:i+5].lower() == 'span' and (
+            i + 5 >= length or not html[i+5].isalnum()
+        ):
+            j = i + 5
+            in_quote: str | None = None
+            while j < length:
+                c = html[j]
+                if in_quote:
+                    if c == in_quote:
+                        in_quote = None
+                elif c in ('"', "'"):
+                    in_quote = c
+                elif c == '>':
+                    # End of tag — strip trailing slash if self-closing
+                    if j > 0 and html[j - 1] == '/':
+                        result.append(html[i:j - 1])
+                        result.append('>')
+                    else:
+                        result.append(html[i:j + 1])
+                    i = j + 1
+                    break
+                j += 1
+            else:
+                # Reached end of string without finding >
+                result.append(html[i:])
+                i = length
+        else:
+            result.append(html[i])
+            i += 1
+    return ''.join(result)
+
 # URL patterns to skip entirely
 SKIP_PATTERNS = [
     "viewprofile",
@@ -312,6 +359,7 @@ class ForumParser:
     def process_page(self, url: str, html: str) -> str:
         """Process HTML: rewrite links, download assets, return modified HTML."""
         local_path = url_to_local_path(normalize_url(url), self.output_dir)
+        html = _fix_self_closing_spans(html)
         soup = BeautifulSoup(html, "html.parser")
 
         # --- Rewrite <a href> links ---

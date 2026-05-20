@@ -1,4 +1,4 @@
-"""Tests for spoiler onclick attribute preservation (issue #7)."""
+"""Tests for spoiler onclick attribute preservation (issues #7 and #11)."""
 import sys
 import os
 import unittest
@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from parser import ForumParser, _SpoilerSafeFormatter
+from parser import ForumParser, _SpoilerSafeFormatter, _fix_self_closing_spans
 from bs4 import BeautifulSoup
 
 
@@ -38,6 +38,90 @@ SPOILER_HTML_FROM_SERVER = """\
 <div class="quotecontent"><div style="display: none;">spoiler content here</div></div></div></div>
 </body>
 </html>"""
+
+
+# Exact HTML from the live forum where the spoiler <span> is self-closing.
+# Browsers ignore the slash on non-void elements and treat the following <b>/<a>
+# as children of the span.  BeautifulSoup's html.parser honours the slash and
+# produces an empty span, breaking the onclick label toggle (issue #11).
+SPOILER_HTML_SELF_CLOSING_SPAN = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div style="text-transform: uppercase; font-weight: bold; display: block;"><span onclick="if (this.parentNode.parentNode.getElementsByTagName('div')[1].getElementsByTagName('div')[0].style.display != '') { this.parentNode.parentNode.getElementsByTagName('div')[1].getElementsByTagName('div')[0].style.display = ''; this.innerHTML = '<b>Спойлер: </b><a href=\\'#\\' onClick=\\'return false;\\'>↓</a>'; } else { this.parentNode.parentNode.getElementsByTagName('div')[1].getElementsByTagName('div')[0].style.display = 'none'; this.innerHTML = '<b>Спойлер: </b><a href=\\'#\\' onClick=\\'return false;\\'>↕</a>'; }" /><b>Спойлер: </b><a href="#" onclick="return false;">↕</a></span></div>
+<div class="quotecontent"><div style="display: none;">spoiler content here</div></div>
+</body>
+</html>"""
+
+
+class TestFixSelfClosingSpans(unittest.TestCase):
+    """Tests for _fix_self_closing_spans (issue #11)."""
+
+    def test_self_closing_span_converted_to_open_tag(self):
+        """<span ... /> must become <span ...> so its following siblings become children."""
+        html = '<span onclick="test" />'
+        result = _fix_self_closing_spans(html)
+        # The trailing slash must be gone; a space before > is acceptable
+        self.assertNotIn('/>', result, "Self-closing slash must be removed")
+        self.assertTrue(result.startswith('<span'), f"Must still be a span tag: {result!r}")
+        self.assertTrue(result.rstrip().endswith('>'), f"Must end with >: {result!r}")
+
+    def test_span_with_onclick_containing_angle_brackets(self):
+        """Self-closing span with < > inside onclick value must be fixed correctly."""
+        html = """<span onclick="this.innerHTML = '<b>X</b>';" />"""
+        result = _fix_self_closing_spans(html)
+        self.assertTrue(result.endswith('>') and not result.endswith('/>'),
+                        f"Expected open tag, got: {result!r}")
+        self.assertIn("this.innerHTML = '<b>X</b>';", result)
+
+    def test_void_elements_unchanged(self):
+        """Void elements like <br />, <img />, <input /> must not be modified."""
+        for tag in ('<br />', '<img src="x.png" />', '<input type="text" />'):
+            self.assertEqual(_fix_self_closing_spans(tag), tag,
+                             f"Void element must not be changed: {tag!r}")
+
+    def test_normal_span_with_closing_tag_unchanged(self):
+        """Regular <span>...</span> must pass through unchanged."""
+        html = '<span class="foo"><b>bar</b></span>'
+        self.assertEqual(_fix_self_closing_spans(html), html)
+
+    def test_spoiler_span_children_preserved_after_fix(self):
+        """After fixing the self-closing span, BeautifulSoup must see <b> and <a>
+        as children of the span, not as siblings."""
+        html = (
+            '<span onclick="test" />'
+            '<b>Спойлер: </b>'
+            '<a href="#" onclick="return false;">↕</a>'
+            '</span>'
+        )
+        fixed = _fix_self_closing_spans(html)
+        soup = BeautifulSoup(fixed, "html.parser")
+        span = soup.find('span')
+        self.assertIsNotNone(span)
+        children = list(span.children)
+        tags = [c.name for c in children if hasattr(c, 'name') and c.name]
+        self.assertIn('b', tags, "After fix, <b> must be a child of the span")
+        self.assertIn('a', tags, "After fix, <a> must be a child of the span")
+
+    def test_process_page_self_closing_span_spoiler(self):
+        """process_page must produce a span that contains <b> and <a> as children
+        so the spoiler label toggle works in the browser (issue #11)."""
+        parser = ForumParser(output_dir="/tmp/test_parser_output")
+        parser.download_image = MagicMock(return_value=None)
+        parser.download_file = MagicMock(return_value=None)
+
+        url = "https://visio.getbb.ru/viewtopic.php?t=1"
+        result = parser.process_page(url, SPOILER_HTML_SELF_CLOSING_SPAN)
+
+        soup = BeautifulSoup(result, "html.parser")
+        span = soup.find('span', onclick=True)
+        self.assertIsNotNone(span, "Spoiler span must be present in output")
+
+        children = [c.name for c in span.children if hasattr(c, 'name') and c.name]
+        self.assertIn('b', children,
+                      "<b>Спойлер:</b> must be a child of the onclick span, not a sibling")
+        self.assertIn('a', children,
+                      "<a> arrow link must be a child of the onclick span, not a sibling")
 
 
 class TestSpoilerFormatter(unittest.TestCase):
