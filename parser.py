@@ -81,6 +81,37 @@ def _fix_self_closing_spans(html: str) -> str:
             i += 1
     return ''.join(result)
 
+
+def _remove_forum_chrome(soup: BeautifulSoup) -> None:
+    """Remove navigation and form controls that are useless in a static archive."""
+    for selector in ("#menubar", "#datebar", "p.searchbar"):
+        for tag in soup.select(selector):
+            tag.decompose()
+
+    pagecontent = soup.find(id="pagecontent")
+    if pagecontent:
+        for table in pagecontent.select("table.tablebg"):
+            table.decompose()
+
+        for cell in pagecontent.find_all("td"):
+            links = cell.find_all("a", href=True)
+            if not links:
+                continue
+            if all("posting.php" in link["href"] for link in links):
+                cell.decompose()
+
+    pagefooter = soup.find(id="pagefooter")
+    if pagefooter:
+        for datetime_tag in pagefooter.find_all(class_="datetime"):
+            datetime_tag.decompose()
+        for child in list(pagefooter.contents):
+            if getattr(child, "name", None) == "table" and "tablebg" in child.get("class", []):
+                continue
+            if getattr(child, "decompose", None):
+                child.decompose()
+            elif not str(child).strip():
+                child.extract()
+
 # URL patterns to skip entirely
 SKIP_PATTERNS = [
     "viewprofile",
@@ -361,6 +392,7 @@ class ForumParser:
         local_path = url_to_local_path(normalize_url(url), self.output_dir)
         html = _fix_self_closing_spans(html)
         soup = BeautifulSoup(html, "html.parser")
+        _remove_forum_chrome(soup)
 
         # --- Rewrite <a href> links ---
         for tag in soup.find_all("a", href=True):
