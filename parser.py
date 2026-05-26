@@ -91,7 +91,8 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
     pagecontent = soup.find(id="pagecontent")
     if pagecontent:
         for table in pagecontent.select("table.tablebg"):
-            table.decompose()
+            if table.find("form", attrs={"name": "viewtopic"}):
+                table.decompose()
 
         for cell in pagecontent.find_all("td"):
             links = cell.find_all("a", href=True)

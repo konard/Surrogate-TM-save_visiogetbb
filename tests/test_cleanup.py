@@ -1,6 +1,7 @@
 """Tests for issue #13: remove forum chrome from saved HTML pages."""
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
@@ -34,7 +35,13 @@ FORUM_CHROME_HTML = """\
       <td align="right">Страница <strong>1</strong> из <strong>1</strong></td>
     </tr>
   </table>
-  <div class="postbody">Useful topic content</div>
+  <table width="100%" cellspacing="1" class="tablebg">
+    <tr>
+      <td class="row1">
+        <div class="postbody">Useful topic content</div>
+      </td>
+    </tr>
+  </table>
   <table width="100%" cellspacing="1" class="tablebg">
     <tr align="center"><td class="cat"><form name="viewtopic"><span class="gensmall">Показать сообщения за:</span></form></td></tr>
   </table>
@@ -58,9 +65,13 @@ FORUM_CHROME_HTML = """\
 
 class TestForumChromeCleanup(unittest.TestCase):
     def setUp(self):
-        self.parser = ForumParser(output_dir="/tmp/test_parser_output")
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.parser = ForumParser(output_dir=self.tempdir.name)
         self.parser.download_image = MagicMock(return_value=None)
         self.parser.download_file = MagicMock(return_value=None)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
 
     def process(self) -> BeautifulSoup:
         result = self.parser.process_page(
@@ -91,8 +102,9 @@ class TestForumChromeCleanup(unittest.TestCase):
         pagecontent = soup.find(id="pagecontent")
 
         self.assertIsNotNone(pagecontent)
-        self.assertIsNone(pagecontent.find("table", class_="tablebg"))
+        self.assertIsNone(pagecontent.find("form", attrs={"name": "viewtopic"}))
         self.assertIn("Useful topic content", pagecontent.get_text(" "))
+        self.assertIsNotNone(pagecontent.find("div", class_="postbody"))
 
     def test_pagefooter_keeps_only_tablebg_without_datetime(self):
         soup = self.process()
