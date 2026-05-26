@@ -38,7 +38,11 @@ FORUM_CHROME_HTML = """\
   <table width="100%" cellspacing="1" class="tablebg">
     <tr>
       <td class="row1">
-        <div class="postbody">Useful topic content</div>
+        <div class="postbody">
+          Useful topic content
+          <span onclick="toggle" /><b>Спойлер: </b><a href="#" onclick="return false;">↕</a></span>
+          <div class="quotecontent"><div style="display: none;">Hidden topic details</div></div>
+        </div>
       </td>
     </tr>
   </table>
@@ -104,7 +108,20 @@ class TestForumChromeCleanup(unittest.TestCase):
         self.assertIsNotNone(pagecontent)
         self.assertIsNone(pagecontent.find("form", attrs={"name": "viewtopic"}))
         self.assertIn("Useful topic content", pagecontent.get_text(" "))
+        self.assertIn("Hidden topic details", pagecontent.get_text(" "))
         self.assertIsNotNone(pagecontent.find("div", class_="postbody"))
+
+    def test_preserves_real_topic_table_with_spoiler_after_sort_table_removal(self):
+        soup = self.process()
+        pagecontent = soup.find(id="pagecontent")
+
+        self.assertIsNotNone(pagecontent)
+        post_table = pagecontent.find("div", class_="postbody").find_parent("table")
+
+        self.assertIsNotNone(post_table)
+        self.assertIn("tablebg", post_table.get("class", []))
+        self.assertIn("Useful topic content", post_table.get_text(" "))
+        self.assertIn("Hidden topic details", post_table.get_text(" "))
 
     def test_pagefooter_keeps_only_tablebg_without_datetime(self):
         soup = self.process()
