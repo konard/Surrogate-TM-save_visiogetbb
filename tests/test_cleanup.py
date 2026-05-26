@@ -4,12 +4,18 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
-from parser import ForumParser
+import parser
+from parser import ForumParser, _remove_forum_chrome
+
+
+assert Path(parser.__file__).resolve() == REPO_ROOT / "parser.py"
 
 
 FORUM_CHROME_HTML = """\
@@ -83,6 +89,18 @@ class TestForumChromeCleanup(unittest.TestCase):
             FORUM_CHROME_HTML,
         )
         return BeautifulSoup(result, "html.parser")
+
+    def test_cleanup_helper_removes_forum_chrome_directly(self):
+        soup = BeautifulSoup(FORUM_CHROME_HTML, "html.parser")
+
+        _remove_forum_chrome(soup)
+
+        self.assertIsNone(soup.find(id="menubar"))
+        self.assertIsNone(soup.find(id="datebar"))
+        self.assertIsNone(soup.find("p", class_="searchbar"))
+        self.assertIsNone(soup.find("form", attrs={"name": "viewtopic"}))
+        self.assertIsNone(soup.find(id="pagefooter").find("p", class_="datetime"))
+        self.assertIsNotNone(soup.find("div", class_="postbody"))
 
     def test_removes_menubar_datebar_and_searchbar(self):
         soup = self.process()
