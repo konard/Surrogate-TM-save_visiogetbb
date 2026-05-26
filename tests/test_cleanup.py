@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import parser
-from parser import ForumParser, _remove_forum_chrome
+from parser import ForumParser, _is_incomplete_topic_page, _remove_forum_chrome
 
 
 assert Path(parser.__file__).resolve() == REPO_ROOT / "parser.py"
@@ -68,6 +68,32 @@ FORUM_CHROME_HTML = """\
   <p class="datetime">Часовой пояс: UTC + 3 часа [ Летнее время ]</p>
   <table width="100%" cellspacing="1" class="tablebg"><tr><td>Footer links</td></tr></table>
   <div class="copyright">Powered by phpBB</div>
+</div>
+</body>
+</html>"""
+
+EMPTY_SAVED_TOPIC_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pageheader">
+<h2><a class="titles" href="viewtopic__f=29&amp;t=236.html">Новые BBCode на форуме</a></h2>
+</div>
+<div id="pagecontent">
+<table cellspacing="1" width="100%">
+<tr>
+<td class="nav" nowrap="nowrap" valign="middle"> Страница <strong>1</strong> из <strong>1</strong><br/></td>
+<td class="gensmall" nowrap="nowrap"> [ Сообщений: 7 ] </td>
+<td align="right" class="gensmall" nowrap="nowrap" width="100%"></td>
+</tr>
+</table>
+<table cellspacing="1" width="100%">
+<tr>
+<td class="nav" nowrap="nowrap" valign="middle"> Страница <strong>1</strong> из <strong>1</strong><br/></td>
+<td class="gensmall" nowrap="nowrap"> [ Сообщений: 7 ] </td>
+<td align="right" class="gensmall" nowrap="nowrap" width="100%"></td>
+</tr>
+</table>
 </div>
 </body>
 </html>"""
@@ -150,6 +176,34 @@ class TestForumChromeCleanup(unittest.TestCase):
         self.assertIsNone(pagefooter.find("p", class_="datetime"))
         self.assertNotIn("Powered by phpBB", pagefooter.get_text(" "))
         self.assertIn("Footer links", pagefooter.get_text(" "))
+
+    def test_detects_incomplete_topic_page_before_saving(self):
+        soup = BeautifulSoup(EMPTY_SAVED_TOPIC_HTML, "html.parser")
+
+        self.assertTrue(
+            _is_incomplete_topic_page(
+                "https://visio.getbb.ru/viewtopic.php?f=29&t=236",
+                soup,
+            )
+        )
+
+    def test_save_page_does_not_write_topic_when_posts_are_missing(self):
+        response = MagicMock()
+        response.headers = {"Content-Type": "text/html; charset=utf-8"}
+        response.text = EMPTY_SAVED_TOPIC_HTML
+        response.content = EMPTY_SAVED_TOPIC_HTML.encode("utf-8")
+        response.url = "https://visio.getbb.ru/viewtopic.php?f=29&t=236"
+        self.parser.fetch = MagicMock(return_value=response)
+
+        self.parser.save_page("https://visio.getbb.ru/viewtopic.php?f=29&t=236")
+
+        self.assertEqual(self.parser.pages_saved, 0)
+        self.assertFalse(
+            (
+                Path(self.tempdir.name)
+                / "viewtopic__f=29&t=236.html"
+            ).exists()
+        )
 
 
 if __name__ == "__main__":

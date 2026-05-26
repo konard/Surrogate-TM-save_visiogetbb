@@ -113,6 +113,38 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
             elif not str(child).strip():
                 child.extract()
 
+
+def _declared_topic_post_count(soup: BeautifulSoup) -> int | None:
+    """Return the post count shown by phpBB topic navigation, if present."""
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return None
+
+    text = pagecontent.get_text(" ", strip=True)
+    match = re.search(r"\[\s*Сообщ(?:ений|ение|ения):\s*(\d+)\s*\]", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _has_topic_posts(soup: BeautifulSoup) -> bool:
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return False
+    return bool(
+        pagecontent.select_one(
+            ".postbody, .postdetails, .postprofile, .postauthor, .postsubject"
+        )
+    )
+
+
+def _is_incomplete_topic_page(url: str, soup: BeautifulSoup) -> bool:
+    parsed = urlparse(url)
+    if not parsed.path.endswith("/viewtopic.php") and parsed.path != "/viewtopic.php":
+        return False
+    declared_count = _declared_topic_post_count(soup)
+    return declared_count is not None and declared_count > 0 and not _has_topic_posts(soup)
+
 # URL patterns to skip entirely
 SKIP_PATTERNS = [
     "viewprofile",
@@ -501,6 +533,17 @@ class ForumParser:
         content_type = resp.headers.get("Content-Type", "")
         if "text/html" not in content_type:
             log.debug("Skipping non-HTML content at %s", norm)
+            return
+
+        soup = BeautifulSoup(_fix_self_closing_spans(resp.text), "html.parser")
+        if _is_incomplete_topic_page(norm, soup):
+            declared_count = _declared_topic_post_count(soup)
+            log.warning(
+                "Skipping incomplete topic page %s: navigation declares %s posts, "
+                "but no post markup was found",
+                norm,
+                declared_count,
+            )
             return
 
         processed_html = self.process_page(norm, resp.text)
