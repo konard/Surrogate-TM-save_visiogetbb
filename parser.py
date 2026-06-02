@@ -84,6 +84,8 @@ def _fix_self_closing_spans(html: str) -> str:
 
 def _remove_forum_chrome(soup: BeautifulSoup) -> None:
     """Remove navigation and form controls that are useless in a static archive."""
+    from bs4 import Comment
+
     for selector in ("#menubar", "#datebar", "p.searchbar"):
         for tag in soup.select(selector):
             tag.decompose()
@@ -107,18 +109,125 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
         for tag in soup.select(selector):
             tag.decompose()
 
-    # Remove LiveInternet and other tracking/counter scripts outside pagefooter
+    # Remove orphaned footer junk that phpBB places outside #pagefooter:
+    # RTB ads, "Кто сейчас на конференции", icon legend, permissions,
+    # search/jumpbox forms, and accompanying <br> spacers.
+    _remove_orphaned_footer_junk(soup)
+
+    # Remove LiveInternet and other tracking/counter scripts
     for script in soup.find_all("script"):
         text = script.get_text()
         if "counter.yadro.ru" in text or "LiveInternet" in text:
             script.decompose()
 
-    # Remove Yandex RTB ad blocks
+    # Remove Yandex RTB ad blocks (div containers and their scripts)
     for div in soup.find_all("div", id=lambda x: x and x.startswith("yandex_rtb_")):
         div.decompose()
     for script in soup.find_all("script"):
         if "Ya.Context.AdvManager" in script.get_text() or "yandexContextAsyncCallbacks" in script.get_text():
             script.decompose()
+
+    # Remove HTML comment nodes for ads, phpBB copyright, LiveInternet markers
+    _remove_junk_comments(soup)
+
+    # Remove author profile hyperlinks (keep visible text, remove <a> wrapper)
+    _unlink_profile_links(soup)
+
+    # Remove reputation change links and icons
+    _remove_reputation_elements(soup)
+
+
+def _remove_orphaned_footer_junk(soup: BeautifulSoup) -> None:
+    """Remove footer tables/elements that phpBB places outside #pagefooter.
+
+    phpBB sometimes emits the dynamic footer tables (online users, permissions,
+    icon legend, search box, jumpbox) as direct children of the outer wrapper
+    div (#wrap or body), not inside #pagefooter.  After #pagefooter is removed
+    these nodes remain as orphans.  We detect them by their content signatures
+    and remove them along with any adjacent <br> spacers.
+    """
+    FOOTER_TABLE_SIGNATURES = [
+        "Кто сейчас на конференции",   # online users table
+        "Новые сообщения",              # icon legend table
+        "Нет новых сообщений",          # icon legend table
+        "Перейти:",                     # jumpbox form
+        "Найти:",                       # search form
+    ]
+
+    FOOTER_FORM_NAMES = {"search", "jumpbox"}
+
+    def _is_footer_table(tag) -> bool:
+        if tag.name != "table":
+            return False
+        # Check for known footer form names
+        for form in tag.find_all("form"):
+            if form.get("name") in FOOTER_FORM_NAMES:
+                return True
+        text = tag.get_text(" ", strip=True)
+        return any(sig in text for sig in FOOTER_TABLE_SIGNATURES)
+
+    # Collect nodes to remove (avoid modifying tree while iterating)
+    to_remove = []
+    for tag in soup.find_all(True):
+        if _is_footer_table(tag):
+            # Also remove immediately preceding/following <br> spacers
+            prev = tag.previous_sibling
+            while prev and getattr(prev, "name", None) in (None, "br") and not getattr(prev, "name", None):
+                # NavigableString (whitespace) — step further
+                prev = prev.previous_sibling
+            if prev and getattr(prev, "name", None) == "br":
+                to_remove.append(prev)
+            to_remove.append(tag)
+    for node in to_remove:
+        node.decompose()
+
+
+def _remove_junk_comments(soup: BeautifulSoup) -> None:
+    """Remove HTML comment nodes for ads, phpBB copyright, and tracking markers."""
+    from bs4 import Comment
+
+    JUNK_COMMENT_PATTERNS = [
+        "Yandex.RTB",
+        "LiveInternet",
+        "phpbb.com",
+        "phpBB Group",
+        "We request you retain",
+        "Powered by phpBB",
+    ]
+
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        if any(pat in comment for pat in JUNK_COMMENT_PATTERNS):
+            comment.extract()
+
+
+def _unlink_profile_links(soup: BeautifulSoup) -> None:
+    """Replace author profile <a> links with plain text, keeping visible content."""
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if "viewprofile" in href or (
+            "memberlist.php" in href and "mode=viewprofile" in href
+        ):
+            a.replace_with_children()
+
+
+def _remove_reputation_elements(soup: BeautifulSoup) -> None:
+    """Remove reputation vote links and their associated icons."""
+    # Reputation links typically point to posting.php?mode=smilies or
+    # a dedicated reputation URL; the most reliable signal is the link text
+    # containing '+' / '-' reputation markers, or href containing 'reputation'
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if "reputation" in href or "viewprofile" not in href and (
+            "post_thanks" in href or "thanks" in href.lower()
+        ):
+            # Only remove if it looks like a reputation/thanks action link
+            if "reputation" in href or "post_thanks" in href:
+                a.decompose()
+    # Remove reputation score spans/divs (class names vary by phpBB style)
+    for tag in soup.find_all(class_=lambda c: c and any(
+        "reputa" in x.lower() or "thanks" in x.lower() for x in (c if isinstance(c, list) else [c])
+    )):
+        tag.decompose()
 
 
 def _declared_topic_post_count(soup: BeautifulSoup) -> int | None:
@@ -301,14 +410,20 @@ class ForumParser:
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    def fetch(self, url: str) -> requests.Response | None:
-        try:
-            resp = self.session.get(url, timeout=30, allow_redirects=True)
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as e:
-            log.warning("Failed to fetch %s: %s", url, e)
-            return None
+    def fetch(self, url: str, retries: int = 3, retry_delay: float = 5.0) -> requests.Response | None:
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.session.get(url, timeout=60, allow_redirects=True)
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as e:
+                if attempt < retries:
+                    log.warning("Failed to fetch %s (attempt %d/%d): %s — retrying in %.0fs",
+                                url, attempt, retries, e, retry_delay)
+                    time.sleep(retry_delay)
+                else:
+                    log.warning("Failed to fetch %s: %s", url, e)
+        return None
 
     # ------------------------------------------------------------------
     # File download helpers

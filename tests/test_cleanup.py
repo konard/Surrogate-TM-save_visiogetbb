@@ -284,5 +284,236 @@ class TestForumChromeCleanup(unittest.TestCase):
         )
 
 
+ORPHANED_FOOTER_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+  <table cellspacing="1" width="100%"><tr><td>Forum topics list</td></tr></table>
+</div>
+<!-- Yandex.RTB R-A-1239576-1 -->
+<br clear="all"/>
+<table cellspacing="1" class="tablebg" width="100%">
+<tr><td class="cat"><h4>Кто сейчас на конференции</h4></td></tr>
+<tr><td class="row1"><p class="gensmall">Сейчас этот форум просматривают: гости: 11</p></td></tr>
+</table>
+<br clear="all"/>
+<table cellspacing="0" width="100%">
+<tr>
+<td align="left" valign="top">
+<table border="0" cellpadding="0" cellspacing="3"><tr>
+<td class="gensmall">Новые сообщения</td>
+<td>  </td>
+<td class="gensmall">Нет новых сообщений</td>
+</tr></table>
+</td>
+<td align="right"><span class="gensmall">Вы <strong>можете</strong> начинать темы</span></td>
+</tr>
+</table>
+<br clear="all"/>
+<table cellspacing="0" width="100%">
+<tr>
+<td><form action="./search.php" method="post" name="search"><span class="gensmall">Найти:</span> <input name="keywords" type="text"/> <input type="submit" value="Перейти"/></form></td>
+<td align="right"><form action="./viewforum.php" method="post" name="jumpbox">
+<select name="f" onchange="submit()"><option value="-1">Выберите форум</option></select>
+<input type="submit" value="Перейти"/>
+</form></td>
+</tr>
+</table>
+<!--
+We request you retain the full copyright notice below including the link to www.phpbb.com.
+The phpBB Group : 2006
+//-->
+<!--LiveInternet counter--><script type="text/javascript">new Image().src = "http://counter.yadro.ru/hit";</script><!--/LiveInternet-->
+</body>
+</html>"""
+
+PROFILE_LINKS_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+  <table class="tablebg"><tr>
+    <td class="postprofile">
+      <a href="./memberlist.php?mode=viewprofile&amp;u=42">AuthorName</a>
+    </td>
+    <td class="postbody">Post content here.</td>
+  </tr></table>
+</div>
+</body>
+</html>"""
+
+REPUTATION_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+  <table class="tablebg"><tr>
+    <td class="postprofile">
+      <a href="./memberlist.php?mode=viewprofile&amp;u=42">AuthorName</a>
+      <br/>
+      <a href="./post_thanks.php?action=add&amp;post_id=123"><img src="plus.gif" alt="+"/></a>
+      <a href="./post_thanks.php?action=remove&amp;post_id=123"><img src="minus.gif" alt="-"/></a>
+      <span class="reputation-score">+5</span>
+    </td>
+    <td class="postbody">Useful post content.</td>
+  </tr></table>
+</div>
+</body>
+</html>"""
+
+
+class TestOrphanedFooterJunkRemoval(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.parser = ForumParser(output_dir=self.tempdir.name)
+        self.parser.download_image = MagicMock(return_value=None)
+        self.parser.download_file = MagicMock(return_value=None)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def process(self, html: str) -> BeautifulSoup:
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewforum.php?f=29",
+            html,
+        )
+        return BeautifulSoup(result, "html.parser")
+
+    def test_orphaned_online_users_table_removed(self):
+        soup = self.process(ORPHANED_FOOTER_HTML)
+        self.assertNotIn("Кто сейчас на конференции", soup.get_text(" "))
+
+    def test_orphaned_icon_legend_table_removed(self):
+        soup = self.process(ORPHANED_FOOTER_HTML)
+        self.assertNotIn("Новые сообщения", soup.get_text(" "))
+        self.assertNotIn("Нет новых сообщений", soup.get_text(" "))
+
+    def test_orphaned_permissions_table_removed(self):
+        soup = self.process(ORPHANED_FOOTER_HTML)
+        self.assertNotIn("можете начинать темы", soup.get_text(" "))
+
+    def test_orphaned_search_jumpbox_forms_removed(self):
+        soup = self.process(ORPHANED_FOOTER_HTML)
+        self.assertIsNone(soup.find("form", attrs={"name": "search"}))
+        self.assertIsNone(soup.find("form", attrs={"name": "jumpbox"}))
+
+    def test_phpbb_copyright_comment_removed(self):
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewforum.php?f=29",
+            ORPHANED_FOOTER_HTML,
+        )
+        self.assertNotIn("phpBB Group", result)
+        self.assertNotIn("www.phpbb.com", result)
+
+    def test_liveinternet_comment_markers_removed(self):
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewforum.php?f=29",
+            ORPHANED_FOOTER_HTML,
+        )
+        self.assertNotIn("LiveInternet counter", result)
+        self.assertNotIn("counter.yadro.ru", result)
+
+    def test_pagecontent_preserved(self):
+        soup = self.process(ORPHANED_FOOTER_HTML)
+        self.assertIn("Forum topics list", soup.get_text(" "))
+
+
+class TestProfileLinkUnlinking(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.parser = ForumParser(output_dir=self.tempdir.name)
+        self.parser.download_image = MagicMock(return_value=None)
+        self.parser.download_file = MagicMock(return_value=None)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def process(self, html: str) -> BeautifulSoup:
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewtopic.php?f=29&t=100",
+            html,
+        )
+        return BeautifulSoup(result, "html.parser")
+
+    def test_profile_link_replaced_with_text(self):
+        soup = self.process(PROFILE_LINKS_HTML)
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            self.assertNotIn("viewprofile", href, f"Profile link not removed: {href}")
+
+    def test_author_name_still_visible(self):
+        soup = self.process(PROFILE_LINKS_HTML)
+        self.assertIn("AuthorName", soup.get_text(" "))
+
+    def test_post_content_preserved(self):
+        soup = self.process(PROFILE_LINKS_HTML)
+        self.assertIn("Post content here", soup.get_text(" "))
+
+
+class TestReputationElementRemoval(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.parser = ForumParser(output_dir=self.tempdir.name)
+        self.parser.download_image = MagicMock(return_value=None)
+        self.parser.download_file = MagicMock(return_value=None)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def process(self, html: str) -> BeautifulSoup:
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewtopic.php?f=29&t=100",
+            html,
+        )
+        return BeautifulSoup(result, "html.parser")
+
+    def test_reputation_links_removed(self):
+        soup = self.process(REPUTATION_HTML)
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            self.assertNotIn("post_thanks", href, f"Reputation link not removed: {href}")
+
+    def test_post_content_preserved_after_reputation_removal(self):
+        soup = self.process(REPUTATION_HTML)
+        self.assertIn("Useful post content", soup.get_text(" "))
+
+
+class TestFetchRetry(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.parser = ForumParser(output_dir=self.tempdir.name)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_fetch_retries_on_timeout(self):
+        import requests as req
+        call_count = []
+
+        def mock_get(*args, **kwargs):
+            call_count.append(1)
+            if len(call_count) < 3:
+                raise req.exceptions.ReadTimeout("timed out")
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        self.parser.session.get = mock_get
+        result = self.parser.fetch("https://example.com/file", retries=3, retry_delay=0)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(call_count), 3)
+
+    def test_fetch_returns_none_after_all_retries_fail(self):
+        import requests as req
+
+        def mock_get(*args, **kwargs):
+            raise req.exceptions.ConnectionError("refused")
+
+        self.parser.session.get = mock_get
+        result = self.parser.fetch("https://example.com/file", retries=2, retry_delay=0)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
