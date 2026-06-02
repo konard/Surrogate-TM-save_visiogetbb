@@ -479,7 +479,7 @@ class TestReputationElementRemoval(unittest.TestCase):
         self.assertIn("Useful post content", soup.get_text(" "))
 
 
-class TestFetchRetry(unittest.TestCase):
+class TestFetch(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.parser = ForumParser(output_dir=self.tempdir.name)
@@ -487,32 +487,181 @@ class TestFetchRetry(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def test_fetch_retries_on_timeout(self):
-        import requests as req
-        call_count = []
+    def test_fetch_returns_response_on_success(self):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        self.parser.session.get = MagicMock(return_value=resp)
 
-        def mock_get(*args, **kwargs):
-            call_count.append(1)
-            if len(call_count) < 3:
-                raise req.exceptions.ReadTimeout("timed out")
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            return resp
-
-        self.parser.session.get = mock_get
-        result = self.parser.fetch("https://example.com/file", retries=3, retry_delay=0)
+        result = self.parser.fetch("https://example.com/file")
         self.assertIsNotNone(result)
-        self.assertEqual(len(call_count), 3)
+        self.parser.session.get.assert_called_once()
 
-    def test_fetch_returns_none_after_all_retries_fail(self):
+    def test_fetch_returns_none_on_failure(self):
         import requests as req
 
-        def mock_get(*args, **kwargs):
-            raise req.exceptions.ConnectionError("refused")
-
-        self.parser.session.get = mock_get
-        result = self.parser.fetch("https://example.com/file", retries=2, retry_delay=0)
+        self.parser.session.get = MagicMock(side_effect=req.exceptions.ConnectionError("refused"))
+        result = self.parser.fetch("https://example.com/file")
         self.assertIsNone(result)
+        self.parser.session.get.assert_called_once()
+
+
+class TestDownloadLog(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.tempdir.name)
+        self.parser = ForumParser(output_dir=self.tempdir.name)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.parser._init_download_log()
+
+    def tearDown(self):
+        # Close the file handler before cleanup to avoid Windows file lock issues
+        if self.parser._download_log_handler:
+            self.parser._download_log_handler.close()
+        self.tempdir.cleanup()
+
+    def _read_log(self) -> str:
+        log_path = self.output_dir / "downloads.log"
+        if not log_path.exists():
+            return ""
+        with open(log_path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_download_log_created_after_init(self):
+        self.assertTrue((self.output_dir / "downloads.log").exists())
+
+    def test_successful_download_logged_ok(self):
+        fake_path = self.output_dir / "file_42.pdf"
+        self.parser._log_download_ok("https://example.com/download/file.php?id=42", fake_path)
+        log_contents = self._read_log()
+        self.assertIn("OK", log_contents)
+        self.assertIn("file.php?id=42", log_contents)
+
+    def test_failed_download_logged_fail(self):
+        self.parser._log_download_fail("https://example.com/download/file.php?id=99", "fetch failed")
+        log_contents = self._read_log()
+        self.assertIn("FAIL", log_contents)
+        self.assertIn("file.php?id=99", log_contents)
+
+
+INDEX_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+<table>
+<tr><td class="cat"><strong>Раздел 1</strong></td></tr>
+<tr>
+  <td class="row1">
+    <a href="./viewforum.php?f=5">Подраздел А</a>
+    <span class="genmed">Описание подраздела А</span>
+  </td>
+</tr>
+</table>
+</div>
+</body>
+</html>"""
+
+FORUM_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+<table>
+<tr><td class="cat">Темы</td></tr>
+<tr>
+  <td class="row1">
+    <a href="./viewtopic.php?f=5&amp;t=10">Первая тема</a>
+  </td>
+</tr>
+</table>
+</div>
+</body>
+</html>"""
+
+TOPIC_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+<table class="tablebg">
+<tr>
+  <td class="postprofile">AuthorName</td>
+  <td class="postbody">Текст первого поста.</td>
+</tr>
+</table>
+</div>
+</body>
+</html>"""
+
+
+class TestJsonExport(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.tempdir.name)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def _write(self, filename: str, content: str) -> None:
+        path = self.output_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def test_json_export_created_by_crawl(self):
+        from unittest.mock import patch
+
+        parser_instance = ForumParser(output_dir=self.tempdir.name)
+        self._write("index.html", INDEX_HTML)
+
+        with patch.object(parser_instance, "crawl", wraps=lambda start_url=None: parser_instance._export_json()):
+            parser_instance._export_json()
+
+        json_path = self.output_dir / "forum.json"
+        self.assertTrue(json_path.exists(), "forum.json should be created")
+
+    def test_json_contains_sections(self):
+        from parser import _build_forum_structure
+        self._write("index.html", INDEX_HTML)
+        structure = _build_forum_structure(self.output_dir)
+        self.assertIn("sections", structure)
+
+    def test_json_sections_have_subsections(self):
+        from parser import _build_forum_structure
+        self._write("index.html", INDEX_HTML)
+        structure = _build_forum_structure(self.output_dir)
+        sections = structure.get("sections", [])
+        self.assertTrue(len(sections) > 0, "Should have at least one section")
+
+    def test_json_threads_extracted_from_saved_forum_page(self):
+        from parser import _build_forum_structure
+        self._write("index.html", INDEX_HTML)
+        self._write("viewforum__f=5.html", FORUM_HTML)
+        structure = _build_forum_structure(self.output_dir)
+        sections = structure.get("sections", [])
+        all_threads = [
+            t
+            for sec in sections
+            for sub in sec.get("subsections", [])
+            for t in sub.get("threads", [])
+        ]
+        self.assertTrue(len(all_threads) > 0, "Should find at least one thread")
+        self.assertIn("Первая тема", all_threads[0]["title"])
+
+    def test_json_posts_extracted_from_saved_topic_page(self):
+        from parser import _build_forum_structure
+        self._write("index.html", INDEX_HTML)
+        self._write("viewforum__f=5.html", FORUM_HTML)
+        self._write("viewtopic__f=5&t=10.html", TOPIC_HTML)
+        structure = _build_forum_structure(self.output_dir)
+        all_posts = [
+            p
+            for sec in structure.get("sections", [])
+            for sub in sec.get("subsections", [])
+            for t in sub.get("threads", [])
+            for p in t.get("posts", [])
+        ]
+        self.assertTrue(len(all_posts) > 0, "Should find at least one post")
+        self.assertIn("Текст первого поста", all_posts[0]["text"])
 
 
 if __name__ == "__main__":

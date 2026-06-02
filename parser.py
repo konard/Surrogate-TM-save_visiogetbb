@@ -9,6 +9,7 @@ Saves a full local copy of the forum with:
 Excludes: viewprofile, search.php, ucp.php
 """
 
+import json
 import os
 import re
 import sys
@@ -386,6 +387,150 @@ def detect_extension_from_response(response: requests.Response, url: str) -> str
     return ext
 
 
+def _extract_index_sections(soup: BeautifulSoup) -> list[dict]:
+    """Parse forum index page: return list of top-level sections with subsections."""
+    sections = []
+    current_section: dict | None = None
+
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return sections
+
+    for row in pagecontent.find_all("tr"):
+        # Section header row (cat class)
+        cat = row.find("td", class_="cat")
+        if cat and not row.find("td", class_=re.compile(r"^(row|forumrow)")):
+            title = cat.get_text(" ", strip=True)
+            current_section = {"title": title, "subsections": []}
+            sections.append(current_section)
+            continue
+
+        if current_section is None:
+            continue
+
+        # Subsection row
+        forum_link = row.find("a", href=re.compile(r"viewforum\.php"))
+        if forum_link:
+            href = forum_link.get("href", "")
+            title = forum_link.get_text(" ", strip=True)
+            desc_td = row.find("td", class_=re.compile(r"(row2|forumrow)"))
+            desc = ""
+            if desc_td:
+                # Description is usually in a <span class="genmed"> or the td's own text
+                desc_tag = desc_td.find("span", class_="genmed") or desc_td.find("p")
+                if desc_tag:
+                    desc = desc_tag.get_text(" ", strip=True)
+            current_section["subsections"].append({
+                "title": title,
+                "url": href,
+                "description": desc,
+                "threads": [],
+            })
+
+    return sections
+
+
+def _extract_forum_threads(soup: BeautifulSoup) -> list[dict]:
+    """Parse a viewforum page: return list of thread stubs."""
+    threads = []
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return threads
+
+    for row in pagecontent.find_all("tr"):
+        link = row.find("a", href=re.compile(r"viewtopic\.php"))
+        if not link:
+            continue
+        title = link.get_text(" ", strip=True)
+        href = link.get("href", "")
+        threads.append({"title": title, "url": href, "posts": []})
+
+    return threads
+
+
+def _extract_topic_posts(soup: BeautifulSoup) -> list[dict]:
+    """Parse a viewtopic page: return list of post dicts."""
+    posts = []
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return posts
+
+    for postbody in pagecontent.find_all(class_="postbody"):
+        post: dict = {}
+
+        # Author: look in the same row's postprofile cell
+        row = postbody.find_parent("tr")
+        if row:
+            profile = row.find(class_="postprofile") or row.find(class_="postauthor")
+            if profile:
+                post["author"] = profile.get_text(" ", strip=True)
+
+        # Post subject
+        subject = postbody.find(class_="postsubject") or postbody.find(class_="subject")
+        if subject:
+            post["subject"] = subject.get_text(" ", strip=True)
+
+        # Post text (all text inside postbody, excluding subject)
+        if subject:
+            subject.extract()
+        post["text"] = postbody.get_text(" ", strip=True)
+
+        # Attachments / file links within this post
+        attachments = []
+        for a in postbody.find_all("a", href=True):
+            href = a.get("href", "")
+            if "download/" in href or "file.php" in href:
+                attachments.append({"label": a.get_text(strip=True), "url": href})
+        if attachments:
+            post["attachments"] = attachments
+
+        posts.append(post)
+
+    return posts
+
+
+def _build_forum_structure(output_dir: Path) -> dict:
+    """Walk saved HTML files and assemble the nested forum dictionary."""
+    result: dict = {"sections": []}
+
+    index_path = output_dir / "index.html"
+    if not index_path.exists():
+        log.warning("forum.json: index.html not found in %s, skipping section structure", output_dir)
+        return result
+
+    with open(index_path, encoding="utf-8") as f:
+        index_soup = BeautifulSoup(f.read(), "html.parser")
+
+    sections = _extract_index_sections(index_soup)
+    result["sections"] = sections
+
+    # For each subsection, find saved viewforum pages and populate threads
+    for section in sections:
+        for subsection in section.get("subsections", []):
+            forum_url = subsection["url"]
+            # Derive local path from URL (may have query string like f=5)
+            norm = normalize_url(urljoin(BASE_URL + "/", forum_url.lstrip("./")))
+            forum_path = url_to_local_path(norm, output_dir)
+            if not forum_path.exists():
+                continue
+            with open(forum_path, encoding="utf-8") as f:
+                forum_soup = BeautifulSoup(f.read(), "html.parser")
+            threads = _extract_forum_threads(forum_soup)
+
+            for thread in threads:
+                topic_url = thread["url"]
+                t_norm = normalize_url(urljoin(BASE_URL + "/", topic_url.lstrip("./")))
+                topic_path = url_to_local_path(t_norm, output_dir)
+                if topic_path.exists():
+                    with open(topic_path, encoding="utf-8") as f:
+                        topic_soup = BeautifulSoup(f.read(), "html.parser")
+                    thread["posts"] = _extract_topic_posts(topic_soup)
+
+            subsection["threads"] = threads
+
+    return result
+
+
 class ForumParser:
     def __init__(self, output_dir: str, delay: float = 1.0, max_pages: int = 0, resume: bool = False):
         self.output_dir = Path(output_dir)
@@ -405,25 +550,44 @@ class ForumParser:
         self.downloaded_files: dict[str, Path] = {}  # url -> local path
         self.queue: deque[str] = deque()
         self.pages_saved = 0
+        self._download_log_handler: logging.FileHandler | None = None
+        self._download_log: logging.Logger | None = None
+
+    def _init_download_log(self) -> None:
+        """Set up a dedicated file logger for download results (called after output_dir is created)."""
+        if self._download_log is not None:
+            return
+        log_path = self.output_dir / "downloads.log"
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        # Use a unique logger name per output directory to avoid handler accumulation
+        # across instances (id() can be reused after GC, so use the path instead)
+        dl_log = logging.Logger(f"forum_downloads.{self.output_dir}")
+        dl_log.setLevel(logging.DEBUG)
+        dl_log.addHandler(handler)
+        self._download_log_handler = handler
+        self._download_log = dl_log
+
+    def _log_download_ok(self, url: str, local_path: Path) -> None:
+        if self._download_log:
+            self._download_log.info("OK %s -> %s", url, local_path)
+
+    def _log_download_fail(self, url: str, reason: str) -> None:
+        if self._download_log:
+            self._download_log.error("FAIL %s : %s", url, reason)
 
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    def fetch(self, url: str, retries: int = 3, retry_delay: float = 5.0) -> requests.Response | None:
-        for attempt in range(1, retries + 1):
-            try:
-                resp = self.session.get(url, timeout=60, allow_redirects=True)
-                resp.raise_for_status()
-                return resp
-            except requests.RequestException as e:
-                if attempt < retries:
-                    log.warning("Failed to fetch %s (attempt %d/%d): %s — retrying in %.0fs",
-                                url, attempt, retries, e, retry_delay)
-                    time.sleep(retry_delay)
-                else:
-                    log.warning("Failed to fetch %s: %s", url, e)
-        return None
+    def fetch(self, url: str) -> requests.Response | None:
+        try:
+            resp = self.session.get(url, timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            log.warning("Failed to fetch %s: %s", url, e)
+            return None
 
     # ------------------------------------------------------------------
     # File download helpers
@@ -437,6 +601,7 @@ class ForumParser:
 
         resp = self.fetch(url)
         if resp is None:
+            self._log_download_fail(url, "fetch failed")
             return None
 
         ext = detect_extension_from_response(resp, url)
@@ -467,6 +632,7 @@ class ForumParser:
             log.debug("Downloaded file: %s -> %s", url, local_path)
 
         self.downloaded_files[norm] = local_path
+        self._log_download_ok(url, local_path)
         return local_path
 
     def download_image(self, url: str) -> Path | None:
@@ -486,6 +652,7 @@ class ForumParser:
 
         resp = self.fetch(url)
         if resp is None:
+            self._log_download_fail(url, "fetch failed")
             return None
 
         if not ext:
@@ -501,6 +668,7 @@ class ForumParser:
             log.debug("Downloaded image: %s -> %s", url, local_path)
 
         self.downloaded_files[norm] = local_path
+        self._log_download_ok(url, local_path)
         return local_path
 
     # ------------------------------------------------------------------
@@ -693,6 +861,7 @@ class ForumParser:
 
     def crawl(self, start_url: str = BASE_URL) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._init_download_log()
         start_norm = normalize_url(start_url)
         self.queue.append(start_norm)
 
@@ -716,6 +885,20 @@ class ForumParser:
             self.pages_saved,
             len(self.downloaded_files),
         )
+        self._export_json()
+
+    # ------------------------------------------------------------------
+    # JSON export
+    # ------------------------------------------------------------------
+
+    def _export_json(self) -> None:
+        """Build a nested JSON structure from saved HTML files and write forum.json."""
+        log.info("Building JSON export from saved pages...")
+        structure = _build_forum_structure(self.output_dir)
+        json_path = self.output_dir / "forum.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(structure, f, ensure_ascii=False, indent=2)
+        log.info("JSON export written to %s", json_path)
 
 
 def main() -> None:
