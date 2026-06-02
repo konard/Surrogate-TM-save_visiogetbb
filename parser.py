@@ -101,17 +101,24 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
             if all("posting.php" in link["href"] for link in links):
                 cell.decompose()
 
-    pagefooter = soup.find(id="pagefooter")
-    if pagefooter:
-        for datetime_tag in pagefooter.find_all(class_="datetime"):
-            datetime_tag.decompose()
-        for child in list(pagefooter.contents):
-            if getattr(child, "name", None) == "table" and "tablebg" in child.get("class", []):
-                continue
-            if getattr(child, "decompose", None):
-                child.decompose()
-            elif not str(child).strip():
-                child.extract()
+    # Remove all footer content: dynamic data (online users, stats, login,
+    # legend, permissions, search forms) is useless in a static archive.
+    for selector in ("#pagefooter", "#wrapfooter"):
+        for tag in soup.select(selector):
+            tag.decompose()
+
+    # Remove LiveInternet and other tracking/counter scripts outside pagefooter
+    for script in soup.find_all("script"):
+        text = script.get_text()
+        if "counter.yadro.ru" in text or "LiveInternet" in text:
+            script.decompose()
+
+    # Remove Yandex RTB ad blocks
+    for div in soup.find_all("div", id=lambda x: x and x.startswith("yandex_rtb_")):
+        div.decompose()
+    for script in soup.find_all("script"):
+        if "Ya.Context.AdvManager" in script.get_text() or "yandexContextAsyncCallbacks" in script.get_text():
+            script.decompose()
 
 
 def _declared_topic_post_count(soup: BeautifulSoup) -> int | None:
@@ -271,10 +278,11 @@ def detect_extension_from_response(response: requests.Response, url: str) -> str
 
 
 class ForumParser:
-    def __init__(self, output_dir: str, delay: float = 1.0, max_pages: int = 0):
+    def __init__(self, output_dir: str, delay: float = 1.0, max_pages: int = 0, resume: bool = False):
         self.output_dir = Path(output_dir)
         self.delay = delay
         self.max_pages = max_pages  # 0 = unlimited
+        self.resume = resume
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -525,6 +533,12 @@ class ForumParser:
         if self.max_pages and self.pages_saved >= self.max_pages:
             return
 
+        local_path = url_to_local_path(norm, self.output_dir)
+        if self.resume and local_path.exists():
+            log.info("Resume: skipping already saved %s", norm)
+            self.pages_saved += 1
+            return
+
         log.info("[%d] Fetching: %s", self.pages_saved + 1, norm)
         resp = self.fetch(norm)
         if resp is None:
@@ -618,6 +632,11 @@ def main() -> None:
         help=f"Starting URL (default: {BASE_URL})",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip pages already saved to the output directory (resume an interrupted download)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -632,6 +651,7 @@ def main() -> None:
         output_dir=args.output,
         delay=args.delay,
         max_pages=args.max_pages,
+        resume=args.resume,
     )
     archiver.crawl(start_url=args.start_url)
 

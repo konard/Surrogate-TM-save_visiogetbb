@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import parser
-from parser import ForumParser, _is_incomplete_topic_page, _remove_forum_chrome
+from parser import ForumParser, _is_incomplete_topic_page, _remove_forum_chrome, url_to_local_path, normalize_url
 
 
 assert Path(parser.__file__).resolve() == REPO_ROOT / "parser.py"
@@ -72,6 +72,43 @@ FORUM_CHROME_HTML = """\
 </body>
 </html>"""
 
+VIEWFORUM_FOOTER_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<div id="pagecontent">
+  <table cellspacing="1" width="100%"><tr><td>Forum topics list</td></tr></table>
+</div>
+<div id="pagefooter">
+  <table cellspacing="1" class="tablebg" width="100%">
+    <tr><td class="cat"><h4>Кто сейчас на конференции</h4></td></tr>
+    <tr><td class="row1"><p class="gensmall">Сейчас этот форум просматривают: нет зарегистрированных пользователей и гости: 6</p></td></tr>
+  </table>
+  <br clear="all"/>
+  <table cellspacing="0" width="100%">
+    <tr>
+      <td align="left" valign="top"><table border="0" cellpadding="0" cellspacing="3"><tr>
+        <td class="gensmall">Новые сообщения</td>
+      </tr></table></td>
+      <td align="right"><span class="gensmall">Вы <strong>можете</strong> начинать темы</span></td>
+    </tr>
+  </table>
+  <br clear="all"/>
+  <table cellspacing="0" width="100%">
+    <tr>
+      <td><form action="./search.php" method="post" name="search"><span class="gensmall">Найти:</span></form></td>
+      <td align="right"><form action="./viewforum.php" method="post" name="jumpbox"><select name="f"><option value="-1">Выберите форум</option></select></form></td>
+    </tr>
+  </table>
+</div>
+<div id="wrapfooter">
+  <span class="copyright">Powered by <a href="http://www.phpbb.com/">phpBB</a></span>
+</div>
+<!--LiveInternet counter--><script type="text/javascript"><!--
+new Image().src = "http://counter.yadro.ru/hit;getbb?r"+escape(document.referrer)+";";//--></script><!--/LiveInternet-->
+</body>
+</html>"""
+
 EMPTY_SAVED_TOPIC_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -125,7 +162,7 @@ class TestForumChromeCleanup(unittest.TestCase):
         self.assertIsNone(soup.find(id="datebar"))
         self.assertIsNone(soup.find("p", class_="searchbar"))
         self.assertIsNone(soup.find("form", attrs={"name": "viewtopic"}))
-        self.assertIsNone(soup.find(id="pagefooter").find("p", class_="datetime"))
+        self.assertIsNone(soup.find(id="pagefooter"))
         self.assertIsNotNone(soup.find("div", class_="postbody"))
 
     def test_removes_menubar_datebar_and_searchbar(self):
@@ -167,15 +204,56 @@ class TestForumChromeCleanup(unittest.TestCase):
         self.assertIn("Useful topic content", post_table.get_text(" "))
         self.assertIn("Hidden topic details", post_table.get_text(" "))
 
-    def test_pagefooter_keeps_only_tablebg_without_datetime(self):
+    def test_pagefooter_removed_entirely(self):
         soup = self.process()
-        pagefooter = soup.find(id="pagefooter")
 
-        self.assertIsNotNone(pagefooter)
-        self.assertIsNotNone(pagefooter.find("table", class_="tablebg"))
-        self.assertIsNone(pagefooter.find("p", class_="datetime"))
-        self.assertNotIn("Powered by phpBB", pagefooter.get_text(" "))
-        self.assertIn("Footer links", pagefooter.get_text(" "))
+        self.assertIsNone(soup.find(id="pagefooter"))
+        self.assertIsNone(soup.find(id="wrapfooter"))
+        self.assertIsNone(soup.find("p", class_="datetime"))
+
+    def test_viewforum_footer_junk_removed(self):
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewforum.php?f=29",
+            VIEWFORUM_FOOTER_HTML,
+        )
+        soup = BeautifulSoup(result, "html.parser")
+
+        self.assertIsNone(soup.find(id="pagefooter"))
+        self.assertIsNone(soup.find(id="wrapfooter"))
+        self.assertIsNone(soup.find("script", string=lambda t: t and "counter.yadro.ru" in t))
+        self.assertNotIn("Кто сейчас на конференции", soup.get_text(" "))
+        self.assertNotIn("Powered by", soup.get_text(" "))
+        self.assertIn("Forum topics list", soup.get_text(" "))
+
+    def test_resume_skips_existing_page(self):
+        self.parser.resume = True
+        url = "https://visio.getbb.ru/viewforum.php?f=1"
+        local_path = url_to_local_path(normalize_url(url), Path(self.tempdir.name))
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text("<html>cached</html>", encoding="utf-8")
+
+        self.parser.fetch = MagicMock()
+        self.parser.save_page(url)
+
+        self.parser.fetch.assert_not_called()
+        self.assertEqual(self.parser.pages_saved, 1)
+
+    def test_no_resume_refetches_existing_page(self):
+        self.parser.resume = False
+        url = "https://visio.getbb.ru/viewforum.php?f=1"
+        local_path = url_to_local_path(normalize_url(url), Path(self.tempdir.name))
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text("<html>cached</html>", encoding="utf-8")
+
+        response = MagicMock()
+        response.headers = {"Content-Type": "text/html; charset=utf-8"}
+        response.text = "<html><body><div id='pagecontent'>ok</div></body></html>"
+        response.content = response.text.encode()
+        self.parser.fetch = MagicMock(return_value=response)
+
+        self.parser.save_page(url)
+
+        self.parser.fetch.assert_called_once()
 
     def test_detects_incomplete_topic_page_before_saving(self):
         soup = BeautifulSoup(EMPTY_SAVED_TOPIC_HTML, "html.parser")
