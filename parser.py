@@ -9,6 +9,7 @@ Saves a full local copy of the forum with:
 Excludes: viewprofile, search.php, ucp.php
 """
 
+import json
 import os
 import re
 import sys
@@ -80,6 +81,186 @@ def _fix_self_closing_spans(html: str) -> str:
             result.append(html[i])
             i += 1
     return ''.join(result)
+
+
+def _remove_forum_chrome(soup: BeautifulSoup) -> None:
+    """Remove navigation and form controls that are useless in a static archive."""
+    from bs4 import Comment
+
+    for selector in ("#menubar", "#datebar", "p.searchbar"):
+        for tag in soup.select(selector):
+            tag.decompose()
+
+    pagecontent = soup.find(id="pagecontent")
+    if pagecontent:
+        for table in pagecontent.select("table.tablebg"):
+            if table.find("form", attrs={"name": "viewtopic"}):
+                table.decompose()
+
+        for cell in pagecontent.find_all("td"):
+            links = cell.find_all("a", href=True)
+            if not links:
+                continue
+            if all("posting.php" in link["href"] for link in links):
+                cell.decompose()
+
+    # Remove all footer content: dynamic data (online users, stats, login,
+    # legend, permissions, search forms) is useless in a static archive.
+    for selector in ("#pagefooter", "#wrapfooter"):
+        for tag in soup.select(selector):
+            tag.decompose()
+
+    # Remove orphaned footer junk that phpBB places outside #pagefooter:
+    # RTB ads, "Кто сейчас на конференции", icon legend, permissions,
+    # search/jumpbox forms, and accompanying <br> spacers.
+    _remove_orphaned_footer_junk(soup)
+
+    # Remove LiveInternet and other tracking/counter scripts
+    for script in soup.find_all("script"):
+        text = script.get_text()
+        if "counter.yadro.ru" in text or "LiveInternet" in text:
+            script.decompose()
+
+    # Remove Yandex RTB ad blocks (div containers and their scripts)
+    for div in soup.find_all("div", id=lambda x: x and x.startswith("yandex_rtb_")):
+        div.decompose()
+    for script in soup.find_all("script"):
+        if "Ya.Context.AdvManager" in script.get_text() or "yandexContextAsyncCallbacks" in script.get_text():
+            script.decompose()
+
+    # Remove HTML comment nodes for ads, phpBB copyright, LiveInternet markers
+    _remove_junk_comments(soup)
+
+    # Remove author profile hyperlinks (keep visible text, remove <a> wrapper)
+    _unlink_profile_links(soup)
+
+    # Remove reputation change links and icons
+    _remove_reputation_elements(soup)
+
+
+def _remove_orphaned_footer_junk(soup: BeautifulSoup) -> None:
+    """Remove footer tables/elements that phpBB places outside #pagefooter.
+
+    phpBB sometimes emits the dynamic footer tables (online users, permissions,
+    icon legend, search box, jumpbox) as direct children of the outer wrapper
+    div (#wrap or body), not inside #pagefooter.  After #pagefooter is removed
+    these nodes remain as orphans.  We detect them by their content signatures
+    and remove them along with any adjacent <br> spacers.
+    """
+    FOOTER_TABLE_SIGNATURES = [
+        "Кто сейчас на конференции",   # online users table
+        "Новые сообщения",              # icon legend table
+        "Нет новых сообщений",          # icon legend table
+        "Перейти:",                     # jumpbox form
+        "Найти:",                       # search form
+    ]
+
+    FOOTER_FORM_NAMES = {"search", "jumpbox"}
+
+    def _is_footer_table(tag) -> bool:
+        if tag.name != "table":
+            return False
+        # Check for known footer form names
+        for form in tag.find_all("form"):
+            if form.get("name") in FOOTER_FORM_NAMES:
+                return True
+        text = tag.get_text(" ", strip=True)
+        return any(sig in text for sig in FOOTER_TABLE_SIGNATURES)
+
+    # Collect nodes to remove (avoid modifying tree while iterating)
+    to_remove = []
+    for tag in soup.find_all(True):
+        if _is_footer_table(tag):
+            # Also remove immediately preceding/following <br> spacers
+            prev = tag.previous_sibling
+            while prev and getattr(prev, "name", None) in (None, "br") and not getattr(prev, "name", None):
+                # NavigableString (whitespace) — step further
+                prev = prev.previous_sibling
+            if prev and getattr(prev, "name", None) == "br":
+                to_remove.append(prev)
+            to_remove.append(tag)
+    for node in to_remove:
+        node.decompose()
+
+
+def _remove_junk_comments(soup: BeautifulSoup) -> None:
+    """Remove HTML comment nodes for ads, phpBB copyright, and tracking markers."""
+    from bs4 import Comment
+
+    JUNK_COMMENT_PATTERNS = [
+        "Yandex.RTB",
+        "LiveInternet",
+        "phpbb.com",
+        "phpBB Group",
+        "We request you retain",
+        "Powered by phpBB",
+    ]
+
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        if any(pat in comment for pat in JUNK_COMMENT_PATTERNS):
+            comment.extract()
+
+
+def _unlink_profile_links(soup: BeautifulSoup) -> None:
+    """Replace author profile <a> links with plain text, keeping visible content."""
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if "viewprofile" in href or (
+            "memberlist.php" in href and "mode=viewprofile" in href
+        ):
+            a.replace_with_children()
+
+
+def _remove_reputation_elements(soup: BeautifulSoup) -> None:
+    """Remove reputation vote links and their associated icons."""
+    # Reputation links typically point to posting.php?mode=smilies or
+    # a dedicated reputation URL; the most reliable signal is the link text
+    # containing '+' / '-' reputation markers, or href containing 'reputation'
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if "reputation" in href or "viewprofile" not in href and (
+            "post_thanks" in href or "thanks" in href.lower()
+        ):
+            # Only remove if it looks like a reputation/thanks action link
+            if "reputation" in href or "post_thanks" in href:
+                a.decompose()
+    # Remove reputation score spans/divs (class names vary by phpBB style)
+    for tag in soup.find_all(class_=lambda c: c and any(
+        "reputa" in x.lower() or "thanks" in x.lower() for x in (c if isinstance(c, list) else [c])
+    )):
+        tag.decompose()
+
+
+def _declared_topic_post_count(soup: BeautifulSoup) -> int | None:
+    """Return the post count shown by phpBB topic navigation, if present."""
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return None
+
+    text = pagecontent.get_text(" ", strip=True)
+    match = re.search(r"\[\s*Сообщ(?:ений|ение|ения):\s*(\d+)\s*\]", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _has_topic_posts(soup: BeautifulSoup) -> bool:
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return False
+    return bool(
+        pagecontent.select_one(
+            ".postbody, .postdetails, .postprofile, .postauthor, .postsubject"
+        )
+    )
+
+
+def _is_incomplete_topic_page(url: str, soup: BeautifulSoup) -> bool:
+    parsed = urlparse(url)
+    if not parsed.path.endswith("/viewtopic.php") and parsed.path != "/viewtopic.php":
+        return False
+    declared_count = _declared_topic_post_count(soup)
+    return declared_count is not None and declared_count > 0 and not _has_topic_posts(soup)
 
 # URL patterns to skip entirely
 SKIP_PATTERNS = [
@@ -206,11 +387,156 @@ def detect_extension_from_response(response: requests.Response, url: str) -> str
     return ext
 
 
+def _extract_index_sections(soup: BeautifulSoup) -> list[dict]:
+    """Parse forum index page: return list of top-level sections with subsections."""
+    sections = []
+    current_section: dict | None = None
+
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return sections
+
+    for row in pagecontent.find_all("tr"):
+        # Section header row (cat class)
+        cat = row.find("td", class_="cat")
+        if cat and not row.find("td", class_=re.compile(r"^(row|forumrow)")):
+            title = cat.get_text(" ", strip=True)
+            current_section = {"title": title, "subsections": []}
+            sections.append(current_section)
+            continue
+
+        if current_section is None:
+            continue
+
+        # Subsection row
+        forum_link = row.find("a", href=re.compile(r"viewforum\.php"))
+        if forum_link:
+            href = forum_link.get("href", "")
+            title = forum_link.get_text(" ", strip=True)
+            desc_td = row.find("td", class_=re.compile(r"(row2|forumrow)"))
+            desc = ""
+            if desc_td:
+                # Description is usually in a <span class="genmed"> or the td's own text
+                desc_tag = desc_td.find("span", class_="genmed") or desc_td.find("p")
+                if desc_tag:
+                    desc = desc_tag.get_text(" ", strip=True)
+            current_section["subsections"].append({
+                "title": title,
+                "url": href,
+                "description": desc,
+                "threads": [],
+            })
+
+    return sections
+
+
+def _extract_forum_threads(soup: BeautifulSoup) -> list[dict]:
+    """Parse a viewforum page: return list of thread stubs."""
+    threads = []
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return threads
+
+    for row in pagecontent.find_all("tr"):
+        link = row.find("a", href=re.compile(r"viewtopic\.php"))
+        if not link:
+            continue
+        title = link.get_text(" ", strip=True)
+        href = link.get("href", "")
+        threads.append({"title": title, "url": href, "posts": []})
+
+    return threads
+
+
+def _extract_topic_posts(soup: BeautifulSoup) -> list[dict]:
+    """Parse a viewtopic page: return list of post dicts."""
+    posts = []
+    pagecontent = soup.find(id="pagecontent")
+    if not pagecontent:
+        return posts
+
+    for postbody in pagecontent.find_all(class_="postbody"):
+        post: dict = {}
+
+        # Author: look in the same row's postprofile cell
+        row = postbody.find_parent("tr")
+        if row:
+            profile = row.find(class_="postprofile") or row.find(class_="postauthor")
+            if profile:
+                post["author"] = profile.get_text(" ", strip=True)
+
+        # Post subject
+        subject = postbody.find(class_="postsubject") or postbody.find(class_="subject")
+        if subject:
+            post["subject"] = subject.get_text(" ", strip=True)
+
+        # Post text (all text inside postbody, excluding subject)
+        if subject:
+            subject.extract()
+        post["text"] = postbody.get_text(" ", strip=True)
+
+        # Attachments / file links within this post
+        attachments = []
+        for a in postbody.find_all("a", href=True):
+            href = a.get("href", "")
+            if "download/" in href or "file.php" in href:
+                attachments.append({"label": a.get_text(strip=True), "url": href})
+        if attachments:
+            post["attachments"] = attachments
+
+        posts.append(post)
+
+    return posts
+
+
+def _build_forum_structure(output_dir: Path) -> dict:
+    """Walk saved HTML files and assemble the nested forum dictionary."""
+    result: dict = {"sections": []}
+
+    index_path = output_dir / "index.html"
+    if not index_path.exists():
+        log.warning("forum.json: index.html not found in %s, skipping section structure", output_dir)
+        return result
+
+    with open(index_path, encoding="utf-8") as f:
+        index_soup = BeautifulSoup(f.read(), "html.parser")
+
+    sections = _extract_index_sections(index_soup)
+    result["sections"] = sections
+
+    # For each subsection, find saved viewforum pages and populate threads
+    for section in sections:
+        for subsection in section.get("subsections", []):
+            forum_url = subsection["url"]
+            # Derive local path from URL (may have query string like f=5)
+            norm = normalize_url(urljoin(BASE_URL + "/", forum_url.lstrip("./")))
+            forum_path = url_to_local_path(norm, output_dir)
+            if not forum_path.exists():
+                continue
+            with open(forum_path, encoding="utf-8") as f:
+                forum_soup = BeautifulSoup(f.read(), "html.parser")
+            threads = _extract_forum_threads(forum_soup)
+
+            for thread in threads:
+                topic_url = thread["url"]
+                t_norm = normalize_url(urljoin(BASE_URL + "/", topic_url.lstrip("./")))
+                topic_path = url_to_local_path(t_norm, output_dir)
+                if topic_path.exists():
+                    with open(topic_path, encoding="utf-8") as f:
+                        topic_soup = BeautifulSoup(f.read(), "html.parser")
+                    thread["posts"] = _extract_topic_posts(topic_soup)
+
+            subsection["threads"] = threads
+
+    return result
+
+
 class ForumParser:
-    def __init__(self, output_dir: str, delay: float = 1.0, max_pages: int = 0):
+    def __init__(self, output_dir: str, delay: float = 1.0, max_pages: int = 0, resume: bool = False):
         self.output_dir = Path(output_dir)
         self.delay = delay
         self.max_pages = max_pages  # 0 = unlimited
+        self.resume = resume
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -224,6 +550,31 @@ class ForumParser:
         self.downloaded_files: dict[str, Path] = {}  # url -> local path
         self.queue: deque[str] = deque()
         self.pages_saved = 0
+        self._download_log_handler: logging.FileHandler | None = None
+        self._download_log: logging.Logger | None = None
+
+    def _init_download_log(self) -> None:
+        """Set up a dedicated file logger for download results (called after output_dir is created)."""
+        if self._download_log is not None:
+            return
+        log_path = self.output_dir / "downloads.log"
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        # Use a unique logger name per output directory to avoid handler accumulation
+        # across instances (id() can be reused after GC, so use the path instead)
+        dl_log = logging.Logger(f"forum_downloads.{self.output_dir}")
+        dl_log.setLevel(logging.DEBUG)
+        dl_log.addHandler(handler)
+        self._download_log_handler = handler
+        self._download_log = dl_log
+
+    def _log_download_ok(self, url: str, local_path: Path) -> None:
+        if self._download_log:
+            self._download_log.info("OK %s -> %s", url, local_path)
+
+    def _log_download_fail(self, url: str, reason: str) -> None:
+        if self._download_log:
+            self._download_log.error("FAIL %s : %s", url, reason)
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -231,7 +582,7 @@ class ForumParser:
 
     def fetch(self, url: str) -> requests.Response | None:
         try:
-            resp = self.session.get(url, timeout=30, allow_redirects=True)
+            resp = self.session.get(url, timeout=60, allow_redirects=True)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
@@ -250,6 +601,7 @@ class ForumParser:
 
         resp = self.fetch(url)
         if resp is None:
+            self._log_download_fail(url, "fetch failed")
             return None
 
         ext = detect_extension_from_response(resp, url)
@@ -280,6 +632,7 @@ class ForumParser:
             log.debug("Downloaded file: %s -> %s", url, local_path)
 
         self.downloaded_files[norm] = local_path
+        self._log_download_ok(url, local_path)
         return local_path
 
     def download_image(self, url: str) -> Path | None:
@@ -299,6 +652,7 @@ class ForumParser:
 
         resp = self.fetch(url)
         if resp is None:
+            self._log_download_fail(url, "fetch failed")
             return None
 
         if not ext:
@@ -314,6 +668,7 @@ class ForumParser:
             log.debug("Downloaded image: %s -> %s", url, local_path)
 
         self.downloaded_files[norm] = local_path
+        self._log_download_ok(url, local_path)
         return local_path
 
     # ------------------------------------------------------------------
@@ -361,6 +716,7 @@ class ForumParser:
         local_path = url_to_local_path(normalize_url(url), self.output_dir)
         html = _fix_self_closing_spans(html)
         soup = BeautifulSoup(html, "html.parser")
+        _remove_forum_chrome(soup)
 
         # --- Rewrite <a href> links ---
         for tag in soup.find_all("a", href=True):
@@ -460,6 +816,12 @@ class ForumParser:
         if self.max_pages and self.pages_saved >= self.max_pages:
             return
 
+        local_path = url_to_local_path(norm, self.output_dir)
+        if self.resume and local_path.exists():
+            log.info("Resume: skipping already saved %s", norm)
+            self.pages_saved += 1
+            return
+
         log.info("[%d] Fetching: %s", self.pages_saved + 1, norm)
         resp = self.fetch(norm)
         if resp is None:
@@ -468,6 +830,17 @@ class ForumParser:
         content_type = resp.headers.get("Content-Type", "")
         if "text/html" not in content_type:
             log.debug("Skipping non-HTML content at %s", norm)
+            return
+
+        soup = BeautifulSoup(_fix_self_closing_spans(resp.text), "html.parser")
+        if _is_incomplete_topic_page(norm, soup):
+            declared_count = _declared_topic_post_count(soup)
+            log.warning(
+                "Skipping incomplete topic page %s: navigation declares %s posts, "
+                "but no post markup was found",
+                norm,
+                declared_count,
+            )
             return
 
         processed_html = self.process_page(norm, resp.text)
@@ -488,6 +861,7 @@ class ForumParser:
 
     def crawl(self, start_url: str = BASE_URL) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._init_download_log()
         start_norm = normalize_url(start_url)
         self.queue.append(start_norm)
 
@@ -511,6 +885,20 @@ class ForumParser:
             self.pages_saved,
             len(self.downloaded_files),
         )
+        self._export_json()
+
+    # ------------------------------------------------------------------
+    # JSON export
+    # ------------------------------------------------------------------
+
+    def _export_json(self) -> None:
+        """Build a nested JSON structure from saved HTML files and write forum.json."""
+        log.info("Building JSON export from saved pages...")
+        structure = _build_forum_structure(self.output_dir)
+        json_path = self.output_dir / "forum.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(structure, f, ensure_ascii=False, indent=2)
+        log.info("JSON export written to %s", json_path)
 
 
 def main() -> None:
@@ -542,6 +930,11 @@ def main() -> None:
         help=f"Starting URL (default: {BASE_URL})",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip pages already saved to the output directory (resume an interrupted download)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -556,6 +949,7 @@ def main() -> None:
         output_dir=args.output,
         delay=args.delay,
         max_pages=args.max_pages,
+        resume=args.resume,
     )
     archiver.crawl(start_url=args.start_url)
 
