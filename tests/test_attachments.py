@@ -7,11 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import requests
 from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from parser import ForumParser
+from parser import ATTACHMENT_ATTEMPTS, ForumParser
 
 
 ATTACHMENT_HTML = """\
@@ -76,6 +77,53 @@ class TestRequestDelay(unittest.TestCase):
         actual_delay = sleep.call_args.args[0]
         self.assertGreater(actual_delay, 0)
         self.assertLessEqual(actual_delay, 0.1)
+
+
+class TestAttachmentRetries(unittest.TestCase):
+    def test_download_file_retries_transient_timeout(self):
+        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        response = MagicMock()
+        response.headers = {
+            "Content-Disposition": 'attachment; filename="manual.pdf"',
+            "Content-Type": "application/pdf",
+        }
+        response.content = b"pdf"
+        response.raise_for_status.return_value = None
+        parser.session.get = MagicMock(
+            side_effect=[requests.ReadTimeout("temporary stall"), response]
+        )
+
+        with patch("parser.time.sleep") as sleep:
+            result = parser.download_file(
+                "https://visio.getbb.ru/download/file.php?id=2032"
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(parser.session.get.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_download_file_stops_after_bounded_attempts(self):
+        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
+
+        with patch("parser.time.sleep") as sleep:
+            result = parser.download_file(
+                "https://visio.getbb.ru/download/file.php?id=2032"
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(parser.session.get.call_count, ATTACHMENT_ATTEMPTS)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [1.0, 2.0],
+        )
+
+    def test_fetch_does_not_retry_forum_pages_by_default(self):
+        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
+
+        self.assertIsNone(parser.fetch("https://visio.getbb.ru/viewtopic.php?t=1"))
+        self.assertEqual(parser.session.get.call_count, 1)
 
 
 if __name__ == "__main__":

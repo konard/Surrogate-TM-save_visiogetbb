@@ -27,6 +27,8 @@ from bs4 import BeautifulSoup
 from bs4.formatter import HTMLFormatter
 
 BASE_URL = "https://visio.getbb.ru"
+ATTACHMENT_ATTEMPTS = 3
+ATTACHMENT_RETRY_DELAY = 1.0
 
 # BeautifulSoup's default formatter escapes < and > inside attribute values (e.g. onclick),
 # which breaks spoiler expand/collapse handlers that use innerHTML with HTML markup.
@@ -581,19 +583,40 @@ class ForumParser:
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    def fetch(self, url: str) -> requests.Response | None:
-        try:
-            if self.delay > 0 and self._last_request_at is not None:
-                elapsed = time.monotonic() - self._last_request_at
-                if elapsed < self.delay:
-                    time.sleep(self.delay - elapsed)
-            resp = self.session.get(url, timeout=60, allow_redirects=True)
-            self._last_request_at = time.monotonic()
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as e:
-            log.warning("Failed to fetch %s: %s", url, e)
-            return None
+    def fetch(self, url: str, attempts: int = 1) -> requests.Response | None:
+        """Fetch a URL, optionally retrying transient request failures."""
+        for attempt in range(1, attempts + 1):
+            try:
+                if self.delay > 0 and self._last_request_at is not None:
+                    elapsed = time.monotonic() - self._last_request_at
+                    if elapsed < self.delay:
+                        time.sleep(self.delay - elapsed)
+                resp = self.session.get(url, timeout=60, allow_redirects=True)
+                self._last_request_at = time.monotonic()
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as e:
+                self._last_request_at = time.monotonic()
+                if attempt == attempts:
+                    log.warning(
+                        "Failed to fetch %s after %d attempt(s): %s",
+                        url,
+                        attempts,
+                        e,
+                    )
+                    return None
+                retry_delay = ATTACHMENT_RETRY_DELAY * attempt
+                log.warning(
+                    "Failed to fetch %s (attempt %d/%d): %s; retrying in %.1fs",
+                    url,
+                    attempt,
+                    attempts,
+                    e,
+                    retry_delay,
+                )
+                time.sleep(retry_delay)
+
+        return None
 
     # ------------------------------------------------------------------
     # File download helpers
@@ -605,7 +628,7 @@ class ForumParser:
         if norm in self.downloaded_files:
             return self.downloaded_files[norm]
 
-        resp = self.fetch(url)
+        resp = self.fetch(url, attempts=ATTACHMENT_ATTEMPTS)
         if resp is None:
             self._log_download_fail(url, "fetch failed")
             return None
