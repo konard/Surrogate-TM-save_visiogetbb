@@ -532,7 +532,7 @@ def _build_forum_structure(output_dir: Path) -> dict:
 
 
 class ForumParser:
-    def __init__(self, output_dir: str, delay: float = 1.0, max_pages: int = 0, resume: bool = False):
+    def __init__(self, output_dir: str, delay: float = 0.1, max_pages: int = 0, resume: bool = False):
         self.output_dir = Path(output_dir)
         self.delay = delay
         self.max_pages = max_pages  # 0 = unlimited
@@ -552,6 +552,7 @@ class ForumParser:
         self.pages_saved = 0
         self._download_log_handler: logging.FileHandler | None = None
         self._download_log: logging.Logger | None = None
+        self._last_request_at: float | None = None
 
     def _init_download_log(self) -> None:
         """Set up a dedicated file logger for download results (called after output_dir is created)."""
@@ -582,7 +583,12 @@ class ForumParser:
 
     def fetch(self, url: str) -> requests.Response | None:
         try:
+            if self.delay > 0 and self._last_request_at is not None:
+                elapsed = time.monotonic() - self._last_request_at
+                if elapsed < self.delay:
+                    time.sleep(self.delay - elapsed)
             resp = self.session.get(url, timeout=60, allow_redirects=True)
+            self._last_request_at = time.monotonic()
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
@@ -742,7 +748,6 @@ class ForumParser:
                 local_file = self.download_file(abs_href)
                 if local_file:
                     tag["href"] = self.make_relative(local_path, local_file)
-                    time.sleep(self.delay)
                 continue
 
             # Forum pages: rewrite to local path and enqueue
@@ -770,11 +775,41 @@ class ForumParser:
                     tag["src"] = self.rewrite_url(abs_src, local_path)
                 continue
 
+            if "download/file.php" in parsed_src.path:
+                local_file = self.download_file(abs_src)
+                if local_file:
+                    tag["src"] = self.make_relative(local_path, local_file)
+                continue
+
             # Download user-content images (may be external)
             local_img = self.download_image(abs_src)
             if local_img:
                 tag["src"] = self.make_relative(local_path, local_img)
-                time.sleep(self.delay * 0.2)
+
+        # --- Download attachments embedded through the Office viewer ---
+        for tag in soup.find_all("iframe", src=True):
+            abs_src = urljoin(url, tag["src"])
+            parsed_src = urlparse(abs_src)
+            attachment_url = None
+
+            if "download/file.php" in parsed_src.path:
+                attachment_url = abs_src
+            elif parsed_src.netloc == "view.officeapps.live.com":
+                values = parse_qs(parsed_src.query).get("src", [])
+                if values:
+                    candidate = values[0]
+                    candidate_parsed = urlparse(candidate)
+                    if (
+                        candidate_parsed.netloc
+                        in ("visio.getbb.ru", "www.visio.getbb.ru")
+                        and "download/file.php" in candidate_parsed.path
+                    ):
+                        attachment_url = candidate
+
+            if attachment_url:
+                local_file = self.download_file(attachment_url)
+                if local_file:
+                    tag["src"] = self.make_relative(local_path, local_file)
 
         # --- Rewrite <link href> (CSS) ---
         for tag in soup.find_all("link", href=True):
@@ -853,7 +888,6 @@ class ForumParser:
 
         self.pages_saved += 1
         log.info("Saved: %s -> %s", norm, local_path.relative_to(self.output_dir))
-        time.sleep(self.delay)
 
     # ------------------------------------------------------------------
     # Crawl entry point
@@ -915,8 +949,8 @@ def main() -> None:
         "-d",
         "--delay",
         type=float,
-        default=1.0,
-        help="Delay in seconds between requests (default: 1.0)",
+        default=0.1,
+        help="Minimum delay in seconds between HTTP requests (default: 0.1)",
     )
     parser.add_argument(
         "--max-pages",
