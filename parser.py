@@ -27,8 +27,27 @@ from bs4 import BeautifulSoup
 from bs4.formatter import HTMLFormatter
 
 BASE_URL = "https://visio.getbb.ru"
+
+# Attachment downloads are retried a bounded number of times per pass.
 ATTACHMENT_ATTEMPTS = 3
 ATTACHMENT_RETRY_DELAY = 1.0
+
+# Healthy responses from getbb arrive in well under a second, so a stalled
+# request is a throttle/tarpit rather than a slow file. Waiting the old 60s
+# read timeout burned a full minute per stalled request for no benefit.
+CONNECT_TIMEOUT = 15.0
+READ_TIMEOUT = 20.0
+
+# When the server starts stalling requests, hammering it keeps the throttle
+# alive. After this many consecutive transient failures, cool down with an
+# exponential (capped) pause so the rate limit can expire.
+THROTTLE_TRIGGER = 3
+THROTTLE_BACKOFF_BASE = 5.0
+THROTTLE_BACKOFF_MAX = 120.0
+
+# Number of deferred passes over transiently-failed downloads after the crawl.
+RETRY_PASSES = 2
+RETRY_PASS_PAUSE = 30.0
 
 # BeautifulSoup's default formatter escapes < and > inside attribute values (e.g. onclick),
 # which breaks spoiler expand/collapse handlers that use innerHTML with HTML markup.
@@ -533,10 +552,36 @@ def _build_forum_structure(output_dir: Path) -> dict:
     return result
 
 
+def is_transient_error(exc: requests.RequestException) -> bool:
+    """Return True if retrying `exc` later could plausibly succeed.
+
+    Timeouts and connection errors are the throttle/tarpit signature seen in
+    issue #17: the attachment exists and downloads fine once the server stops
+    stalling. HTTP 4xx (other than 429) is a permanent answer, so retrying it
+    only wastes time on links that are simply dead.
+    """
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    return True
+
+
 class ForumParser:
-    def __init__(self, output_dir: str, delay: float = 0.1, max_pages: int = 0, resume: bool = False):
+    def __init__(
+        self,
+        output_dir: str,
+        delay: float = 0.1,
+        max_pages: int = 0,
+        resume: bool = False,
+        connect_timeout: float = CONNECT_TIMEOUT,
+        read_timeout: float = READ_TIMEOUT,
+        retry_passes: int = RETRY_PASSES,
+    ):
         self.output_dir = Path(output_dir)
         self.delay = delay
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+        self.retry_passes = retry_passes
         self.max_pages = max_pages  # 0 = unlimited
         self.resume = resume
         self.session = requests.Session()
@@ -550,11 +595,17 @@ class ForumParser:
         )
         self.visited_pages: set[str] = set()
         self.downloaded_files: dict[str, Path] = {}  # url -> local path
+        # Remembering failures keeps a dead or stalled URL from being re-fetched
+        # once per referencing page (one attachment cost 42 attempts in #17).
+        self.failed_downloads: dict[str, str] = {}  # url -> reason
+        self.retry_queue: dict[str, str] = {}  # url -> "file" | "image"
         self.queue: deque[str] = deque()
         self.pages_saved = 0
         self._download_log_handler: logging.FileHandler | None = None
         self._download_log: logging.Logger | None = None
         self._last_request_at: float | None = None
+        self._consecutive_failures = 0
+        self.last_failure_transient = False
 
     def _init_download_log(self) -> None:
         """Set up a dedicated file logger for download results (called after output_dir is created)."""
@@ -579,24 +630,56 @@ class ForumParser:
         if self._download_log:
             self._download_log.error("FAIL %s : %s", url, reason)
 
+    def _record_download_failure(self, norm: str, url: str, kind: str) -> None:
+        """Remember a failed download and queue it for a deferred retry."""
+        transient = self.last_failure_transient
+        reason = "fetch failed (temporary)" if transient else "fetch failed (permanent)"
+        self.failed_downloads[norm] = reason
+        if transient:
+            self.retry_queue[norm] = kind
+        self._log_download_fail(url, reason)
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
 
     def fetch(self, url: str, attempts: int = 1) -> requests.Response | None:
-        """Fetch a URL, optionally retrying transient request failures."""
+        """Fetch a URL, retrying only failures that can plausibly succeed later.
+
+        Sets ``self.last_failure_transient`` so callers can tell a temporary
+        stall (worth a deferred retry) from a permanent error such as 404.
+        """
+        self.last_failure_transient = False
+
         for attempt in range(1, attempts + 1):
             try:
                 if self.delay > 0 and self._last_request_at is not None:
                     elapsed = time.monotonic() - self._last_request_at
                     if elapsed < self.delay:
                         time.sleep(self.delay - elapsed)
-                resp = self.session.get(url, timeout=60, allow_redirects=True)
+                resp = self.session.get(
+                    url,
+                    timeout=(self.connect_timeout, self.read_timeout),
+                    allow_redirects=True,
+                )
                 self._last_request_at = time.monotonic()
                 resp.raise_for_status()
+                self._consecutive_failures = 0
                 return resp
             except requests.RequestException as e:
                 self._last_request_at = time.monotonic()
+                transient = is_transient_error(e)
+                self.last_failure_transient = transient
+
+                if not transient:
+                    # 404/403 and friends will never succeed; retrying only
+                    # multiplies the cost of a link that is simply dead.
+                    log.warning("Failed to fetch %s (permanent): %s", url, e)
+                    return None
+
+                self._consecutive_failures += 1
+                self._cool_down_if_throttled()
+
                 if attempt == attempts:
                     log.warning(
                         "Failed to fetch %s after %d attempt(s): %s",
@@ -605,6 +688,7 @@ class ForumParser:
                         e,
                     )
                     return None
+
                 retry_delay = ATTACHMENT_RETRY_DELAY * attempt
                 log.warning(
                     "Failed to fetch %s (attempt %d/%d): %s; retrying in %.1fs",
@@ -618,6 +702,22 @@ class ForumParser:
 
         return None
 
+    def _cool_down_if_throttled(self) -> None:
+        """Pause after a run of transient failures so a rate limit can expire."""
+        if self._consecutive_failures < THROTTLE_TRIGGER:
+            return
+        overshoot = self._consecutive_failures - THROTTLE_TRIGGER
+        pause = min(THROTTLE_BACKOFF_BASE * (2**overshoot), THROTTLE_BACKOFF_MAX)
+        log.warning(
+            "%d consecutive request failures; backing off for %.1fs "
+            "to let the server-side throttle expire",
+            self._consecutive_failures,
+            pause,
+        )
+        # Drop pooled sockets: a tarpitted keep-alive connection stays stalled.
+        self.session.close()
+        time.sleep(pause)
+
     # ------------------------------------------------------------------
     # File download helpers
     # ------------------------------------------------------------------
@@ -627,10 +727,14 @@ class ForumParser:
         norm = normalize_url(url)
         if norm in self.downloaded_files:
             return self.downloaded_files[norm]
+        if norm in self.failed_downloads:
+            # Already attempted this run; a deferred pass will retry it if the
+            # failure was transient. Re-fetching now costs a stall per page.
+            return None
 
         resp = self.fetch(url, attempts=ATTACHMENT_ATTEMPTS)
         if resp is None:
-            self._log_download_fail(url, "fetch failed")
+            self._record_download_failure(norm, url, "file")
             return None
 
         ext = detect_extension_from_response(resp, url)
@@ -669,6 +773,8 @@ class ForumParser:
         norm = normalize_url(url)
         if norm in self.downloaded_files:
             return self.downloaded_files[norm]
+        if norm in self.failed_downloads:
+            return None
 
         parsed = urlparse(url)
         # Build a safe local path under images/
@@ -679,9 +785,9 @@ class ForumParser:
             rel = "image"
         _, ext = os.path.splitext(rel)
 
-        resp = self.fetch(url)
+        resp = self.fetch(url, attempts=ATTACHMENT_ATTEMPTS)
         if resp is None:
-            self._log_download_fail(url, "fetch failed")
+            self._record_download_failure(norm, url, "image")
             return None
 
         if not ext:
@@ -937,12 +1043,56 @@ class ForumParser:
 
             self.save_page(norm)
 
+        self.retry_failed_downloads()
+
         log.info(
-            "Crawl complete. Pages saved: %d, Files downloaded: %d",
+            "Crawl complete. Pages saved: %d, Files downloaded: %d, "
+            "Downloads still failing: %d",
             self.pages_saved,
             len(self.downloaded_files),
+            len(self.failed_downloads),
         )
         self._export_json()
+
+    def retry_failed_downloads(self) -> int:
+        """Re-attempt transiently-failed downloads after the crawl.
+
+        By this point the throttle that stalled them has usually expired, so a
+        deferred pass recovers attachments that no amount of in-place retrying
+        could get. Returns the number of downloads recovered.
+        """
+        recovered = 0
+        for pass_no in range(1, self.retry_passes + 1):
+            if not self.retry_queue:
+                break
+
+            pending = dict(self.retry_queue)
+            self.retry_queue.clear()
+            log.info(
+                "Retry pass %d/%d for %d failed download(s)",
+                pass_no,
+                self.retry_passes,
+                len(pending),
+            )
+            # Start from fresh sockets and give the server a moment to recover.
+            self.session.close()
+            self._consecutive_failures = 0
+            if RETRY_PASS_PAUSE > 0:
+                time.sleep(RETRY_PASS_PAUSE)
+
+            for norm, kind in pending.items():
+                # Clear the memoized failure so the download is attempted again.
+                self.failed_downloads.pop(norm, None)
+                if kind == "image":
+                    result = self.download_image(norm)
+                else:
+                    result = self.download_file(norm)
+                if result is not None:
+                    recovered += 1
+
+        if recovered:
+            log.info("Recovered %d download(s) in deferred retry passes", recovered)
+        return recovered
 
     # ------------------------------------------------------------------
     # JSON export
@@ -992,6 +1142,30 @@ def main() -> None:
         help="Skip pages already saved to the output directory (resume an interrupted download)",
     )
     parser.add_argument(
+        "--read-timeout",
+        type=float,
+        default=READ_TIMEOUT,
+        help=(
+            "Seconds to wait for response data before treating a request as "
+            f"stalled (default: {READ_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=CONNECT_TIMEOUT,
+        help=f"Seconds to wait for connection (default: {CONNECT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--retry-passes",
+        type=int,
+        default=RETRY_PASSES,
+        help=(
+            "Deferred passes over temporarily failed downloads after the crawl "
+            f"(0 = disabled, default: {RETRY_PASSES})"
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -1007,6 +1181,9 @@ def main() -> None:
         delay=args.delay,
         max_pages=args.max_pages,
         resume=args.resume,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
+        retry_passes=args.retry_passes,
     )
     archiver.crawl(start_url=args.start_url)
 
