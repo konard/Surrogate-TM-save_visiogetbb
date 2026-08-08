@@ -211,6 +211,37 @@ class TestForumChromeCleanup(unittest.TestCase):
         self.assertIsNone(soup.find(id="wrapfooter"))
         self.assertIsNone(soup.find("p", class_="datetime"))
 
+    def test_removes_topic_print_previous_and_next_navigation(self):
+        html = """<html><body><div id="pagecontent"><table><tr>
+        <td class="nav"><a href="./viewtopic.php?f=2&amp;t=40&amp;view=print">Для печати</a></td>
+        <td class="nav"><a href="./viewtopic.php?f=2&amp;t=40&amp;view=previous">Пред. тема</a> |
+        <a href="./viewtopic.php?f=2&amp;t=40&amp;view=next">След. тема</a></td>
+        </tr></table><div class="postbody">Useful post</div></div></body></html>"""
+
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewtopic.php?f=2&t=40", html
+        )
+        soup = BeautifulSoup(result, "html.parser")
+
+        self.assertNotIn("Для печати", soup.get_text(" "))
+        self.assertNotIn("Пред. тема", soup.get_text(" "))
+        self.assertNotIn("След. тема", soup.get_text(" "))
+        self.assertIn("Useful post", soup.get_text(" "))
+
+    def test_removes_topic_permissions_footer_table(self):
+        html = """<html><body><div id="pagecontent"><div class="postbody">Useful post</div></div>
+        <table cellspacing="1" width="100%"><tr><td></td><td><span class="gensmall">
+        Вы <strong>не можете</strong> начинать темы<br/>Вы <strong>не можете</strong> отвечать на сообщения<br/>
+        Вы <strong>не можете</strong> добавлять вложения</span></td></tr></table></body></html>"""
+
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewtopic.php?f=2&t=40", html
+        )
+        soup = BeautifulSoup(result, "html.parser")
+
+        self.assertNotIn("не можете", soup.get_text(" "))
+        self.assertIn("Useful post", soup.get_text(" "))
+
     def test_viewforum_footer_junk_removed(self):
         result = self.parser.process_page(
             "https://visio.getbb.ru/viewforum.php?f=29",
@@ -282,6 +313,51 @@ class TestForumChromeCleanup(unittest.TestCase):
                 / "viewtopic__f=29&t=236.html"
             ).exists()
         )
+
+
+class TestTopicUrlCanonicalization(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.parser = ForumParser(output_dir=self.tempdir.name)
+        self.parser.download_image = MagicMock(return_value=None)
+        self.parser.download_file = MagicMock(return_value=None)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_topic_variants_normalize_to_one_url(self):
+        expected = "https://visio.getbb.ru/viewtopic.php?f=2&t=40"
+        variants = [
+            "https://visio.getbb.ru/viewtopic.php?f=2&t=40&p=181",
+            "https://visio.getbb.ru/viewtopic.php?f=2&t=40&view=print",
+        ]
+
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertEqual(normalize_url(variant), expected)
+
+    def test_post_permalink_becomes_anchor_and_is_not_enqueued(self):
+        html = """<html><body><div id="pagecontent"><table><tr>
+        <td><a href="./viewtopic.php?p=178#p178"><img alt="Сообщение" src="target.gif"/></a></td>
+        </tr></table></div></body></html>"""
+
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewtopic.php?f=2&t=40", html
+        )
+        soup = BeautifulSoup(result, "html.parser")
+
+        self.assertEqual(soup.find("a")["href"], "#p178")
+        self.assertEqual(list(self.parser.queue), [])
+
+    def test_post_permalink_without_fragment_uses_post_id_anchor(self):
+        html = '<html><body><a href="./viewtopic.php?f=2&amp;t=40&amp;p=181">quoted post</a></body></html>'
+
+        result = self.parser.process_page(
+            "https://visio.getbb.ru/viewtopic.php?f=2&t=40", html
+        )
+        soup = BeautifulSoup(result, "html.parser")
+
+        self.assertEqual(soup.find("a")["href"], "#p181")
 
 
 ORPHANED_FOOTER_HTML = """\

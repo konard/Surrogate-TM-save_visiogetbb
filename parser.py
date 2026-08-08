@@ -125,6 +125,17 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
             if all("posting.php" in link["href"] for link in links):
                 cell.decompose()
 
+        # Print and adjacent-topic controls create duplicate topic variants.
+        for cell in pagecontent.find_all("td"):
+            links = cell.find_all("a", href=True)
+            if links and all(
+                "viewtopic.php" in link["href"]
+                and parse_qs(urlparse(link["href"]).query).get("view", [""])[0]
+                in {"print", "previous", "next"}
+                for link in links
+            ):
+                cell.decompose()
+
     # Remove all footer content: dynamic data (online users, stats, login,
     # legend, permissions, search forms) is useless in a static archive.
     for selector in ("#pagefooter", "#wrapfooter"):
@@ -174,6 +185,9 @@ def _remove_orphaned_footer_junk(soup: BeautifulSoup) -> None:
         "Нет новых сообщений",          # icon legend table
         "Перейти:",                     # jumpbox form
         "Найти:",                       # search form
+        "не можете начинать темы",       # topic permissions table
+        "не можете отвечать на сообщения",
+        "не можете добавлять вложения",
     ]
 
     FOOTER_FORM_NAMES = {"search", "jumpbox"}
@@ -186,7 +200,7 @@ def _remove_orphaned_footer_junk(soup: BeautifulSoup) -> None:
             if form.get("name") in FOOTER_FORM_NAMES:
                 return True
         text = tag.get_text(" ", strip=True)
-        return any(sig in text for sig in FOOTER_TABLE_SIGNATURES)
+        return any(sig.casefold() in text.casefold() for sig in FOOTER_TABLE_SIGNATURES)
 
     # Collect nodes to remove (avoid modifying tree while iterating)
     to_remove = []
@@ -313,6 +327,14 @@ def normalize_url(url: str) -> str:
     """Return a canonical URL with session params stripped."""
     parsed = urlparse(url)
     params = parse_qs(parsed.query, keep_blank_values=True)
+    if parsed.path.endswith("/viewtopic.php") or parsed.path == "/viewtopic.php":
+        # Post permalinks and print variants are alternate ways to reach a
+        # topic, not separate pages worth archiving. ``view=next/previous`` is
+        # removed from page chrome instead: the server resolves it to another
+        # topic, so rewriting it to the current ``t`` would be incorrect.
+        params.pop("p", None)
+        if params.get("view") == ["print"]:
+            params.pop("view", None)
     cleaned = {k: v for k, v in params.items() if k not in STRIP_PARAMS}
     new_query = urlencode({k: v[0] for k, v in cleaned.items()}, doseq=False)
     return urlunparse(parsed._replace(query=new_query, fragment=""))
@@ -870,6 +892,18 @@ class ForumParser:
 
             if should_skip(norm):
                 tag["href"] = "#"
+                continue
+
+            # phpBB post permalinks point back into the current topic. Keep
+            # them as local anchors instead of crawling another topic copy.
+            post_ids = parse_qs(parsed.query).get("p", [])
+            if (
+                post_ids
+                and (parsed.path.endswith("/viewtopic.php") or parsed.path == "/viewtopic.php")
+            ):
+                tag["href"] = parsed.fragment or f"#p{post_ids[0]}"
+                if not tag["href"].startswith("#"):
+                    tag["href"] = "#" + tag["href"]
                 continue
 
             # File downloads: download and rewrite
