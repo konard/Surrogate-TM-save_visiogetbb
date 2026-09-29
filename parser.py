@@ -532,6 +532,41 @@ def _extract_topic_posts(soup: BeautifulSoup) -> list[dict]:
     return posts
 
 
+POST_LINK_ATTR = "data-archive-post"
+_POST_ANCHOR_RE = re.compile(r"^p(\d+)$")
+
+
+def _page_post_ids(soup: BeautifulSoup) -> set[str]:
+    """Return ids of posts anchored on this page (``id``/``name`` = ``p<id>``)."""
+    ids: set[str] = set()
+    for tag in soup.find_all(attrs={"id": _POST_ANCHOR_RE}):
+        ids.add(_POST_ANCHOR_RE.match(tag["id"]).group(1))
+    for tag in soup.find_all(attrs={"name": _POST_ANCHOR_RE}):
+        ids.add(_POST_ANCHOR_RE.match(tag["name"]).group(1))
+    return ids
+
+
+def _local_path_to_url(path: Path, output_dir: Path) -> str:
+    """Invert ``url_to_local_path`` for saved ``viewtopic`` pages."""
+    rel = path.relative_to(output_dir).as_posix()
+    base, _ext = os.path.splitext(rel)
+    name, _sep, query = base.partition("__")
+    url = f"{BASE_URL}/{name}.php"
+    return f"{url}?{query}" if query else url
+
+
+def build_post_index(output_dir: Path) -> dict[str, str]:
+    """Map every archived post id to the topic page URL that contains it."""
+    index: dict[str, str] = {}
+    for path in sorted(output_dir.glob("viewtopic*.html")):
+        with open(path, encoding="utf-8") as f:
+            soup = BeautifulSoup(f.read(), "html.parser")
+        page_url = _local_path_to_url(path, output_dir)
+        for post_id in _page_post_ids(soup):
+            index.setdefault(post_id, page_url)
+    return dict(sorted(index.items(), key=lambda item: int(item[0])))
+
+
 def _build_forum_structure(output_dir: Path) -> dict:
     """Walk saved HTML files and assemble the nested forum dictionary."""
     result: dict = {"sections": []}
@@ -874,6 +909,7 @@ class ForumParser:
         html = _fix_self_closing_spans(html)
         soup = BeautifulSoup(html, "html.parser")
         _remove_forum_chrome(soup)
+        page_post_ids = _page_post_ids(soup)
 
         # --- Rewrite <a href> links ---
         for tag in soup.find_all("a", href=True):
@@ -894,16 +930,20 @@ class ForumParser:
                 tag["href"] = "#"
                 continue
 
-            # phpBB post permalinks point back into the current topic. Keep
-            # them as local anchors instead of crawling another topic copy.
+            # phpBB post permalinks: posts on this page become local anchors.
+            # Posts elsewhere (e.g. quotes from other topics) are resolved
+            # after the crawl, once we know which page holds each post.
             post_ids = parse_qs(parsed.query).get("p", [])
             if (
                 post_ids
                 and (parsed.path.endswith("/viewtopic.php") or parsed.path == "/viewtopic.php")
             ):
-                tag["href"] = parsed.fragment or f"#p{post_ids[0]}"
-                if not tag["href"].startswith("#"):
-                    tag["href"] = "#" + tag["href"]
+                post_id = post_ids[0]
+                if post_id in page_post_ids:
+                    tag["href"] = f"#p{post_id}"
+                else:
+                    tag["href"] = f"{BASE_URL}/viewtopic.php?p={post_id}#p{post_id}"
+                    tag[POST_LINK_ATTR] = post_id
                 continue
 
             # File downloads: download and rewrite
@@ -1078,6 +1118,7 @@ class ForumParser:
             self.save_page(norm)
 
         self.retry_failed_downloads()
+        self.resolve_post_links()
 
         log.info(
             "Crawl complete. Pages saved: %d, Files downloaded: %d, "
@@ -1127,6 +1168,45 @@ class ForumParser:
         if recovered:
             log.info("Recovered %d download(s) in deferred retry passes", recovered)
         return recovered
+
+    def resolve_post_links(self) -> int:
+        """Point cross-page post links at the saved page holding the post.
+
+        Writes ``posts.json`` (post id -> topic page URL) and rewrites links
+        marked during ``process_page``. Posts that were not archived keep
+        their online URL. Returns the number of links rewritten.
+        """
+        index = build_post_index(self.output_dir)
+        with open(self.output_dir / "posts.json", "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+        log.info("Post index written: %d post(s)", len(index))
+
+        rewritten = 0
+        for path in sorted(self.output_dir.glob("*.html")):
+            with open(path, encoding="utf-8") as f:
+                html = f.read()
+            if POST_LINK_ATTR not in html:
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            changed = False
+            for tag in soup.find_all(attrs={POST_LINK_ATTR: True}):
+                post_id = tag[POST_LINK_ATTR]
+                page_url = index.get(post_id)
+                if page_url is None:
+                    continue
+                target = url_to_local_path(page_url, self.output_dir)
+                if target == path:
+                    tag["href"] = f"#p{post_id}"
+                else:
+                    tag["href"] = f"{self.make_relative(path, target)}#p{post_id}"
+                del tag[POST_LINK_ATTR]
+                changed = True
+                rewritten += 1
+            if changed:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(soup.decode(formatter=_SpoilerSafeFormatter()))
+        log.info("Resolved %d cross-page post link(s)", rewritten)
+        return rewritten
 
     # ------------------------------------------------------------------
     # JSON export

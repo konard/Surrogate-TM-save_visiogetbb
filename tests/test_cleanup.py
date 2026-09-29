@@ -1,4 +1,5 @@
 """Tests for issue #13: remove forum chrome from saved HTML pages."""
+import json
 import os
 import sys
 import tempfile
@@ -338,7 +339,7 @@ class TestTopicUrlCanonicalization(unittest.TestCase):
 
     def test_post_permalink_becomes_anchor_and_is_not_enqueued(self):
         html = """<html><body><div id="pagecontent"><table><tr>
-        <td><a href="./viewtopic.php?p=178#p178"><img alt="Сообщение" src="target.gif"/></a></td>
+        <td><a name="p178"></a><a href="./viewtopic.php?p=178#p178"><img alt="Сообщение" src="target.gif"/></a></td>
         </tr></table></div></body></html>"""
 
         result = self.parser.process_page(
@@ -346,18 +347,43 @@ class TestTopicUrlCanonicalization(unittest.TestCase):
         )
         soup = BeautifulSoup(result, "html.parser")
 
-        self.assertEqual(soup.find("a")["href"], "#p178")
+        self.assertEqual(soup.find("a", href=True)["href"], "#p178")
         self.assertEqual(list(self.parser.queue), [])
 
     def test_post_permalink_without_fragment_uses_post_id_anchor(self):
-        html = '<html><body><a href="./viewtopic.php?f=2&amp;t=40&amp;p=181">quoted post</a></body></html>'
+        html = '<html><body><a name="p181"></a><a href="./viewtopic.php?f=2&amp;t=40&amp;p=181">quoted post</a></body></html>'
 
         result = self.parser.process_page(
             "https://visio.getbb.ru/viewtopic.php?f=2&t=40", html
         )
         soup = BeautifulSoup(result, "html.parser")
 
-        self.assertEqual(soup.find("a")["href"], "#p181")
+        self.assertEqual(soup.find("a", href=True)["href"], "#p181")
+
+    def test_quote_of_post_on_another_page_links_to_that_page(self):
+        # Issue #17 comment: p=12770 lives on t=1398&start=20, not the quoting topic.
+        target = Path(self.tempdir.name) / "viewtopic__f=5&t=1398&start=20.html"
+        target.write_text('<html><body><a name="p12770"></a>post</body></html>', encoding="utf-8")
+        html = '<html><body><a name="p1"></a><a href="./viewtopic.php?p=12770#p12770">quote</a></body></html>'
+        quoting_url = "https://visio.getbb.ru/viewtopic.php?f=2&t=40"
+        quoting = url_to_local_path(quoting_url, Path(self.tempdir.name))
+        quoting.write_text(self.parser.process_page(quoting_url, html), encoding="utf-8")
+
+        self.assertEqual(self.parser.resolve_post_links(), 1)
+
+        soup = BeautifulSoup(quoting.read_text(encoding="utf-8"), "html.parser")
+        self.assertEqual(soup.find("a", href=True)["href"], "viewtopic__f=5&t=1398&start=20.html#p12770")
+        index = json.loads((Path(self.tempdir.name) / "posts.json").read_text(encoding="utf-8"))
+        self.assertEqual(index["12770"], "https://visio.getbb.ru/viewtopic.php?f=5&t=1398&start=20")
+        self.assertEqual(index["1"], quoting_url)
+
+    def test_unarchived_cross_page_post_keeps_online_url(self):
+        html = '<html><body><a href="./viewtopic.php?p=999">quote</a></body></html>'
+        result = self.parser.process_page("https://visio.getbb.ru/viewtopic.php?f=2&t=40", html)
+        self.assertEqual(
+            BeautifulSoup(result, "html.parser").find("a")["href"],
+            "https://visio.getbb.ru/viewtopic.php?p=999#p999",
+        )
 
 
 ORPHANED_FOOTER_HTML = """\
