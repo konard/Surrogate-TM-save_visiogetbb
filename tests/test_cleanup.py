@@ -766,5 +766,43 @@ class TestJsonExport(unittest.TestCase):
         self.assertIn("Текст первого поста", all_posts[0]["text"])
 
 
+class TestTopicHeader(unittest.TestCase):
+    """Issue #17: page navigation and post permalink labels."""
+
+    PAGE_2 = """<div id="pagecontent"><table><tr>
+<td class="nav">&nbsp;Страница <strong>2</strong> из <strong>2</strong><br /></td>
+<td class="gensmall">&nbsp;[ Сообщений: 35 ]&nbsp;</td>
+<td class="gensmall"><b><a href="#" onclick="jumpto(); return false;">На страницу</a> <a href="./viewtopic.php?f=2&amp;t=1129&amp;start=0">Пред.</a>&nbsp;&nbsp;<a href="./viewtopic.php?f=2&amp;t=1129">1</a><span class="page-sep">, </span><strong>2</strong></b></td>
+</tr></table></div>"""
+
+    PAGE_1 = """<div id="pagecontent"><table><tr>
+<td class="gensmall"><b><a href="#" onclick="jumpto(); return false;">На страницу</a> <strong>1</strong><span class="page-sep">, </span><a href="./viewtopic.php?f=2&amp;t=1129&amp;start=20">2</a> &nbsp;<a href="./viewtopic.php?f=2&amp;t=1129&amp;start=20">След.</a></b></td>
+</tr></table></div>"""
+
+    POST = """<div id="pagecontent"><table><tr>
+<td class="gensmall"><div style="float: right;"><a href="./viewtopic.php?p=9845#p9845"><img src="./styles/subsilver2-modded/imageset/icon_post_target.gif" alt="Сообщение" title="Сообщение" /></a><b>Добавлено:</b> 27 сен 2016, 01:32&nbsp;</div></td>
+</tr></table></div>"""
+
+    def _clean(self, html):
+        soup = BeautifulSoup(html, "html.parser")
+        _remove_forum_chrome(soup)
+        return soup
+
+    def test_step_links_removed_and_page_numbers_kept(self):
+        for html, number in ((self.PAGE_1, "2"), (self.PAGE_2, "1")):
+            soup = self._clean(html)
+            texts = [a.get_text() for a in soup.find_all("a")]
+            self.assertEqual(texts, [number])
+            for label in ("На страницу", "Пред.", "След."):
+                self.assertNotIn(label, soup.get_text())
+
+    def test_permalink_shows_post_number(self):
+        soup = self._clean(self.POST)
+        img = soup.find("img")
+        self.assertEqual(img["alt"], "#p9845")
+        self.assertEqual(img["title"], "#p9845")
+        self.assertEqual(soup.find("b").get_text(), "\u00a0\u00a0Добавлено:")
+
+
 if __name__ == "__main__":
     unittest.main()

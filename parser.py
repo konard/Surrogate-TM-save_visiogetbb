@@ -23,12 +23,12 @@ from collections import deque
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from bs4.formatter import HTMLFormatter
 
 BASE_URL = "https://visio.getbb.ru"
 
-# Attachment downloads are retried a bounded number of times per pass.
+# Total attempts per attachment over the whole run, deferred passes included.
 ATTACHMENT_ATTEMPTS = 3
 ATTACHMENT_RETRY_DELAY = 1.0
 
@@ -43,11 +43,14 @@ READ_TIMEOUT = 20.0
 # exponential (capped) pause so the rate limit can expire.
 THROTTLE_TRIGGER = 3
 THROTTLE_BACKOFF_BASE = 5.0
-THROTTLE_BACKOFF_MAX = 120.0
+THROTTLE_BACKOFF_MAX = 30.0
 
 # Number of deferred passes over transiently-failed downloads after the crawl.
 RETRY_PASSES = 2
 RETRY_PASS_PAUSE = 30.0
+
+# Markdown table of attachments that could not be downloaded (issue #17).
+FAILED_ATTACHMENTS_FILE = "failed_attachments.md"
 
 # BeautifulSoup's default formatter escapes < and > inside attribute values (e.g. onclick),
 # which breaks spoiler expand/collapse handlers that use innerHTML with HTML markup.
@@ -136,6 +139,10 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
             ):
                 cell.decompose()
 
+        _remove_pagination_step_links(pagecontent)
+
+    _label_post_permalinks(soup)
+
     # Remove all footer content: dynamic data (online users, stats, login,
     # legend, permissions, search forms) is useless in a static archive.
     for selector in ("#pagefooter", "#wrapfooter"):
@@ -168,6 +175,40 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
 
     # Remove reputation change links and icons
     _remove_reputation_elements(soup)
+
+
+_PAGINATION_STEP_LABELS = {"На страницу", "Пред.", "След."}
+
+
+def _remove_pagination_step_links(pagecontent) -> None:
+    """Drop the "На страницу", "Пред." and "След." links from page navigation.
+
+    "На страницу" is a JavaScript jump box and the step links duplicate the
+    numbered page links, so they are dead or redundant in a static archive.
+    """
+    for link in pagecontent.find_all("a"):
+        if link.get_text(strip=True) not in _PAGINATION_STEP_LABELS:
+            continue
+        # Drop the spacing that separated the link from its neighbours.
+        for sibling in (link.previous_sibling, link.next_sibling):
+            if isinstance(sibling, NavigableString) and not sibling.strip():
+                sibling.extract()
+        link.decompose()
+
+
+def _label_post_permalinks(soup: BeautifulSoup) -> None:
+    """Show the post number ("#p9845") on the permalink icon of each post."""
+    for img in soup.find_all("img", src=re.compile(r"icon_post_target")):
+        link = img.find_parent("a", href=True)
+        if not link:
+            continue
+        match = re.search(r"#(p\d+)$", link["href"])
+        if not match:
+            continue
+        img["alt"] = img["title"] = f"#{match.group(1)}"
+        added = link.find_next_sibling("b")
+        if added and added.string and added.string.startswith("Добавлено"):
+            added.string = "\u00a0\u00a0" + added.string
 
 
 def _remove_orphaned_footer_junk(soup: BeautifulSoup) -> None:
@@ -656,6 +697,9 @@ class ForumParser:
         # once per referencing page (one attachment cost 42 attempts in #17).
         self.failed_downloads: dict[str, str] = {}  # url -> reason
         self.retry_queue: dict[str, str] = {}  # url -> "file" | "image"
+        self.download_attempts: dict[str, int] = {}  # url -> attempts spent
+        # Forum posts that reference each attachment, for the failure report.
+        self.attachment_posts: dict[str, list[str]] = {}
         self.queue: deque[str] = deque()
         self.pages_saved = 0
         self._download_log_handler: logging.FileHandler | None = None
@@ -663,6 +707,7 @@ class ForumParser:
         self._last_request_at: float | None = None
         self._consecutive_failures = 0
         self.last_failure_transient = False
+        self.last_attempts_used = 0
 
     def _init_download_log(self) -> None:
         """Set up a dedicated file logger for download results (called after output_dir is created)."""
@@ -692,9 +737,17 @@ class ForumParser:
         transient = self.last_failure_transient
         reason = "fetch failed (temporary)" if transient else "fetch failed (permanent)"
         self.failed_downloads[norm] = reason
-        if transient:
+        if transient and self._attempts_left(norm) > 0:
             self.retry_queue[norm] = kind
         self._log_download_fail(url, reason)
+
+    def _attempts_left(self, norm: str) -> int:
+        return ATTACHMENT_ATTEMPTS - self.download_attempts.get(norm, 0)
+
+    def _attempts_now(self, norm: str) -> int:
+        """Attempts to spend on this fetch, keeping some for deferred passes."""
+        reserved = self.retry_passes if norm not in self.download_attempts else 0
+        return max(1, min(self._attempts_left(norm), ATTACHMENT_ATTEMPTS - reserved))
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -707,6 +760,7 @@ class ForumParser:
         stall (worth a deferred retry) from a permanent error such as 404.
         """
         self.last_failure_transient = False
+        self.last_attempts_used = 0
 
         for attempt in range(1, attempts + 1):
             try:
@@ -722,9 +776,11 @@ class ForumParser:
                 self._last_request_at = time.monotonic()
                 resp.raise_for_status()
                 self._consecutive_failures = 0
+                self.last_attempts_used = attempt
                 return resp
             except requests.RequestException as e:
                 self._last_request_at = time.monotonic()
+                self.last_attempts_used = attempt
                 transient = is_transient_error(e)
                 self.last_failure_transient = transient
 
@@ -789,7 +845,12 @@ class ForumParser:
             # failure was transient. Re-fetching now costs a stall per page.
             return None
 
-        resp = self.fetch(url, attempts=ATTACHMENT_ATTEMPTS)
+        if self._attempts_left(norm) <= 0:
+            return None
+        resp = self.fetch(url, attempts=self._attempts_now(norm))
+        self.download_attempts[norm] = (
+            self.download_attempts.get(norm, 0) + self.last_attempts_used
+        )
         if resp is None:
             self._record_download_failure(norm, url, "file")
             return None
@@ -842,7 +903,12 @@ class ForumParser:
             rel = "image"
         _, ext = os.path.splitext(rel)
 
-        resp = self.fetch(url, attempts=ATTACHMENT_ATTEMPTS)
+        if self._attempts_left(norm) <= 0:
+            return None
+        resp = self.fetch(url, attempts=self._attempts_now(norm))
+        self.download_attempts[norm] = (
+            self.download_attempts.get(norm, 0) + self.last_attempts_used
+        )
         if resp is None:
             self._record_download_failure(norm, url, "image")
             return None
@@ -903,9 +969,40 @@ class ForumParser:
     # HTML processing
     # ------------------------------------------------------------------
 
+    def _note_attachment_post(self, attachment_url: str, tag, page_url: str) -> None:
+        """Remember which forum post links to an attachment."""
+        anchor = tag.find_previous(attrs={"id": _POST_ANCHOR_RE}) or tag.find_previous(
+            attrs={"name": _POST_ANCHOR_RE}
+        )
+        if anchor is not None:
+            post_id = _POST_ANCHOR_RE.match(anchor.get("id") or anchor["name"]).group(1)
+            post_url = f"{BASE_URL}/viewtopic.php?p={post_id}#p{post_id}"
+        else:
+            post_url = page_url
+        posts = self.attachment_posts.setdefault(normalize_url(attachment_url), [])
+        if post_url not in posts:
+            posts.append(post_url)
+
+    def write_failed_attachments(self) -> int:
+        """Write a Markdown table of attachments that never downloaded."""
+        rows = [
+            (post, url)
+            for url, posts in self.attachment_posts.items()
+            if url in self.failed_downloads
+            for post in posts
+        ]
+        lines = ["| Сообщение форума | Путь к вложению |", "| --- | --- |"]
+        lines += [f"| {post} | {url} |" for post, url in rows]
+        path = self.output_dir / FAILED_ATTACHMENTS_FILE
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        log.info("Failed attachments: %d (listed in %s)", len(rows), path)
+        return len(rows)
+
     def process_page(self, url: str, html: str) -> str:
         """Process HTML: rewrite links, download assets, return modified HTML."""
-        local_path = url_to_local_path(normalize_url(url), self.output_dir)
+        norm_page = normalize_url(url)
+        local_path = url_to_local_path(norm_page, self.output_dir)
         html = _fix_self_closing_spans(html)
         soup = BeautifulSoup(html, "html.parser")
         _remove_forum_chrome(soup)
@@ -948,6 +1045,7 @@ class ForumParser:
 
             # File downloads: download and rewrite
             if "download/file.php" in parsed.path:
+                self._note_attachment_post(abs_href, tag, norm_page)
                 local_file = self.download_file(abs_href)
                 if local_file:
                     tag["href"] = self.make_relative(local_path, local_file)
@@ -979,6 +1077,7 @@ class ForumParser:
                 continue
 
             if "download/file.php" in parsed_src.path:
+                self._note_attachment_post(abs_src, tag, norm_page)
                 local_file = self.download_file(abs_src)
                 if local_file:
                     tag["src"] = self.make_relative(local_path, local_file)
@@ -1010,6 +1109,7 @@ class ForumParser:
                         attachment_url = candidate
 
             if attachment_url:
+                self._note_attachment_post(attachment_url, tag, norm_page)
                 local_file = self.download_file(attachment_url)
                 if local_file:
                     tag["src"] = self.make_relative(local_path, local_file)
@@ -1119,6 +1219,7 @@ class ForumParser:
 
         self.retry_failed_downloads()
         self.resolve_post_links()
+        self.write_failed_attachments()
 
         log.info(
             "Crawl complete. Pages saved: %d, Files downloaded: %d, "

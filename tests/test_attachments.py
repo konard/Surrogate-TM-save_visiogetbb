@@ -90,7 +90,7 @@ class TestRequestDelay(unittest.TestCase):
 
 class TestAttachmentRetries(unittest.TestCase):
     def test_download_file_retries_transient_timeout(self):
-        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=0)
         response = MagicMock()
         response.headers = {
             "Content-Disposition": 'attachment; filename="manual.pdf"',
@@ -112,7 +112,7 @@ class TestAttachmentRetries(unittest.TestCase):
         sleep.assert_called_once_with(1.0)
 
     def test_download_file_stops_after_bounded_attempts(self):
-        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=0)
         parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
 
         with patch("parser.time.sleep") as sleep:
@@ -161,7 +161,7 @@ class TestPermanentFailures(unittest.TestCase):
         self.assertEqual(parser.session.get.call_count, 1)
 
     def test_server_error_is_treated_as_transient(self):
-        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=0)
         parser.session.get = MagicMock(return_value=_timeout_response(503))
 
         with patch("parser.time.sleep"):
@@ -187,7 +187,7 @@ class TestFailureMemoization(unittest.TestCase):
     """Issue #17: one stalled attachment was re-fetched 42 times in a run."""
 
     def test_failed_url_is_not_refetched_within_a_run(self):
-        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=0)
         parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
         url = "https://visio.getbb.ru/download/file.php?id=1849"
 
@@ -199,7 +199,7 @@ class TestFailureMemoization(unittest.TestCase):
         self.assertEqual(parser.session.get.call_count, ATTACHMENT_ATTEMPTS)
 
     def test_failed_image_is_not_refetched_within_a_run(self):
-        parser = ForumParser("/tmp/test_parser_output", delay=0)
+        parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=0)
         parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
         url = "https://visio.getbb.ru/images/ranks/visio_getbb_ru/logo.png"
 
@@ -226,7 +226,7 @@ class TestDeferredRetryPass(unittest.TestCase):
 
         # Stall for every attempt of the crawl, then succeed once retried later.
         parser.session.get = MagicMock(
-            side_effect=[requests.ReadTimeout("stall")] * ATTACHMENT_ATTEMPTS
+            side_effect=[requests.ReadTimeout("stall")] * (ATTACHMENT_ATTEMPTS - 1)
             + [response]
         )
 
@@ -246,12 +246,13 @@ class TestDeferredRetryPass(unittest.TestCase):
 
         with patch("parser.time.sleep"):
             parser.download_file(url)
-            parser.session.get.reset_mock()
             recovered = parser.retry_failed_downloads()
 
         self.assertEqual(recovered, 0)
-        # Two bounded passes, each of ATTACHMENT_ATTEMPTS -- not an open loop.
-        self.assertEqual(parser.session.get.call_count, 2 * ATTACHMENT_ATTEMPTS)
+        # Issue #17: no more than three attempts per attachment in the whole
+        # run -- one during the crawl and one in each deferred pass.
+        self.assertEqual(parser.session.get.call_count, ATTACHMENT_ATTEMPTS)
+        self.assertEqual(parser.retry_queue, {})
         self.assertIn(normalize_url(url), parser.failed_downloads)
 
     def test_retry_passes_can_be_disabled(self):
@@ -312,6 +313,39 @@ class TestRequestTimeout(unittest.TestCase):
 
         _, kwargs = parser.session.get.call_args
         self.assertEqual(kwargs["timeout"], (CONNECT_TIMEOUT, READ_TIMEOUT))
+
+
+class TestFailedAttachmentReport(unittest.TestCase):
+    """Issue #17: list attachments that never downloaded, with their posts."""
+
+    def test_report_lists_post_and_attachment_and_page_is_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parser = ForumParser(tmp, delay=0, retry_passes=2)
+            parser.download_image = MagicMock(return_value=None)
+            parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
+            html = (
+                '<html><body><div id="pagecontent">'
+                '<a name="p12770"></a><div class="postbody">'
+                '<a href="./download/file.php?id=2040">file.vsd</a></div>'
+                "</div></body></html>"
+            )
+            page = "https://visio.getbb.ru/viewtopic.php?f=18&t=906"
+
+            with patch("parser.time.sleep"):
+                processed = parser.process_page(page, html)
+                parser.retry_failed_downloads()
+            count = parser.write_failed_attachments()
+
+            self.assertIn("file.php?id=2040", processed)
+            self.assertEqual(count, 1)
+            self.assertEqual(parser.session.get.call_count, ATTACHMENT_ATTEMPTS)
+            report = (Path(tmp) / "failed_attachments.md").read_text(encoding="utf-8")
+            self.assertIn("| Сообщение форума | Путь к вложению |", report)
+            self.assertIn(
+                "| https://visio.getbb.ru/viewtopic.php?p=12770#p12770 "
+                "| https://visio.getbb.ru/download/file.php?id=2040 |",
+                report,
+            )
 
 
 if __name__ == "__main__":
