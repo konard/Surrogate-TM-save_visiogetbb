@@ -121,3 +121,29 @@ class TestHostOutage(unittest.TestCase):
         self.assertTrue(parser.last_failure_transient)
         self.assertEqual(parser.last_attempts_used, 0)
         self.assertEqual(parser.session.get.call_count, 7)
+
+
+class TestRecoveredAttachmentLinks(unittest.TestCase):
+    def test_recovered_attachment_is_linked_from_saved_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parser = ForumParser(tmp, delay=0)
+            start = BASE_URL + '/viewtopic.php?t=1'
+            html = ('<a name="p1"></a><a href="./download/file.php?id=2040">file</a>'
+                    '<img src="./download/file.php?id=2040">'
+                    '<iframe src="https://view.officeapps.live.com/op/view.aspx?src='
+                    'https://visio.getbb.ru/download/file.php?id=2040"></iframe>')
+            download = response('binary')
+            download.headers['Content-Type'] = 'application/pdf'
+            parser.session.get = MagicMock(side_effect=[response(html),
+                                                       requests.ReadTimeout('stall'), download])
+            try:
+                with patch('parser.time.sleep'):
+                    parser.crawl(start)
+                saved = url_to_local_path(start, Path(tmp)).read_text()
+                self.assertIn('href="download/file_2040.pdf"', saved)
+                self.assertNotIn('file.php?id=2040', saved)
+                soup = BeautifulSoup(saved, 'html.parser')
+                self.assertEqual(soup.img['src'], 'download/file_2040.pdf')
+                self.assertEqual(soup.iframe['src'], 'download/file_2040.pdf')
+            finally:
+                parser._download_log_handler.close()

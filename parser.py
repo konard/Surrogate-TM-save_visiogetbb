@@ -807,8 +807,9 @@ class ForumParser:
                 if self._consecutive_failures >= HOST_FAILURE_LIMIT:
                     log.warning(
                         "Host %s failed %d consecutive requests; deferring further "
-                        "requests until the next retry pass (use --resume later)",
-                        host, self._consecutive_failures,
+                        "requests until the next retry pass (use --resume later). "
+                        "Last failure: %s: %s",
+                        host, self._consecutive_failures, url, e,
                     )
                     return None
 
@@ -1278,6 +1279,7 @@ class ForumParser:
             self.retry_failed_downloads()
         finally:
             # Ctrl-C must still leave a usable archive and a post index.
+            self.resolve_download_links()
             self.resolve_post_links()
             self.write_failed_attachments()
             with open(self.output_dir / "failed_pages.json", "w", encoding="utf-8") as f:
@@ -1308,8 +1310,6 @@ class ForumParser:
                 continue
 
             self.save_page(norm)
-
-
     def retry_failed_downloads(self) -> int:
         """Re-attempt transiently-failed downloads after the crawl.
 
@@ -1350,6 +1350,31 @@ class ForumParser:
         if recovered:
             log.info("Recovered %d download(s) in deferred retry passes", recovered)
         return recovered
+
+    def resolve_download_links(self) -> int:
+        """Update saved HTML references to assets recovered in deferred passes."""
+        rewritten = 0
+        for path in sorted(self.output_dir.glob("*.html")):
+            soup = BeautifulSoup(path.read_text(encoding="utf-8"), "html.parser")
+            changed = False
+            for tag in soup.find_all(["a", "img", "iframe", "link", "script"]):
+                attr = "href" if tag.name in {"a", "link"} else "src"
+                value = tag.get(attr)
+                if not value or value.startswith("#"):
+                    continue
+                url = urljoin(BASE_URL + "/", value)
+                parsed = urlparse(url)
+                if tag.name == "iframe" and parsed.netloc == "view.officeapps.live.com":
+                    url = parse_qs(parsed.query).get("src", [url])[0]
+                target = self.downloaded_files.get(normalize_url(url))
+                if target is not None:
+                    tag[attr] = self.make_relative(path, target)
+                    changed = True
+                    rewritten += 1
+            if changed:
+                path.write_text(soup.decode(formatter=_SpoilerSafeFormatter()), encoding="utf-8")
+        log.info("Resolved %d recovered asset link(s)", rewritten)
+        return rewritten
 
     def resolve_post_links(self) -> int:
         """Point cross-page post links at the saved page holding the post.
@@ -1469,6 +1494,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--resolve-post-links",
+        action="store_true",
+        help="Rebuild posts.json and repair quoted-post links in an existing archive without HTTP requests",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -1488,6 +1518,11 @@ def main() -> None:
         read_timeout=args.read_timeout,
         retry_passes=args.retry_passes,
     )
+    if args.resolve_post_links:
+        if not archiver.output_dir.is_dir():
+            parser.error("--resolve-post-links requires an existing output directory")
+        archiver.resolve_post_links()
+        return
     archiver.crawl(start_url=args.start_url)
 
 
