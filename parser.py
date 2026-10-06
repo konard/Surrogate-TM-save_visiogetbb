@@ -1310,6 +1310,7 @@ class ForumParser:
                 continue
 
             self.save_page(norm)
+
     def retry_failed_downloads(self) -> int:
         """Re-attempt transiently-failed downloads after the crawl.
 
