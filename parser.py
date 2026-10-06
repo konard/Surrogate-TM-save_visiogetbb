@@ -692,6 +692,8 @@ class ForumParser:
             }
         )
         self.visited_pages: set[str] = set()
+        self.failed_pages: dict[str, bool] = {}  # URL -> temporary failure
+        self.page_attempts: dict[str, int] = {}
         self.downloaded_files: dict[str, Path] = {}  # url -> local path
         # Remembering failures keeps a dead or stalled URL from being re-fetched
         # once per referencing page (one attachment cost 42 attempts in #17).
@@ -1157,12 +1159,15 @@ class ForumParser:
         local_path = url_to_local_path(norm, self.output_dir)
         if self.resume and local_path.exists():
             log.info("Resume: skipping already saved %s", norm)
+            self._enqueue_saved_links(local_path)
             self.pages_saved += 1
             return
 
         log.info("[%d] Fetching: %s", self.pages_saved + 1, norm)
         resp = self.fetch(norm)
+        self.page_attempts[norm] = self.page_attempts.get(norm, 0) + self.last_attempts_used
         if resp is None:
+            self.failed_pages[norm] = self.last_failure_transient
             return
 
         content_type = resp.headers.get("Content-Type", "")
@@ -1179,6 +1184,7 @@ class ForumParser:
                 norm,
                 declared_count,
             )
+            self.failed_pages[norm] = True
             return
 
         processed_html = self.process_page(norm, resp.text)
@@ -1190,7 +1196,40 @@ class ForumParser:
             f.write(processed_html)
 
         self.pages_saved += 1
+        self.failed_pages.pop(norm, None)
         log.info("Saved: %s -> %s", norm, local_path.relative_to(self.output_dir))
+
+    def _enqueue_saved_links(self, path: Path) -> None:
+        """Continue discovery through cached pages, whose links are already local."""
+        soup = BeautifulSoup(path.read_text(encoding="utf-8"), "html.parser")
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"]
+            if not href or href.startswith("#"):
+                continue
+            parsed = urlparse(href)
+            if parsed.scheme or parsed.netloc:
+                if parsed.netloc not in ("visio.getbb.ru", "www.visio.getbb.ru"):
+                    continue
+                url = href
+            else:
+                # '?' and '&' are part of the archive filename, not a URL query.
+                local = path.parent / urllib.parse.unquote(href.split("#", 1)[0])
+                try:
+                    rel = local.resolve().relative_to(self.output_dir.resolve())
+                except ValueError:
+                    continue
+                if rel.suffix != ".html":
+                    continue
+                name, _, query = rel.with_suffix("").as_posix().partition("__")
+                url = f"{BASE_URL}/{name}.php"
+                if query:
+                    url += f"?{query}"
+            parsed = urlparse(url)
+            if parse_qs(parsed.query).get("p"):
+                continue
+            norm = normalize_url(url)
+            if is_forum_page(norm) and not should_skip(norm) and norm not in self.visited_pages:
+                self.queue.append(norm)
 
     # ------------------------------------------------------------------
     # Crawl entry point
@@ -1202,6 +1241,40 @@ class ForumParser:
         start_norm = normalize_url(start_url)
         self.queue.append(start_norm)
 
+        try:
+            self._drain_page_queue()
+            for pass_no in range(1, self.retry_passes + 1):
+                pending = [url for url, temporary in self.failed_pages.items()
+                           if temporary and self.page_attempts.get(url, 0) < ATTACHMENT_ATTEMPTS]
+                if not pending or (self.max_pages and self.pages_saved >= self.max_pages):
+                    break
+                log.info("Page retry pass %d/%d: %d page(s)", pass_no, self.retry_passes, len(pending))
+                self.session.close()
+                if RETRY_PASS_PAUSE > 0:
+                    time.sleep(RETRY_PASS_PAUSE)
+                for url in pending:
+                    self.visited_pages.discard(url)
+                    self.queue.append(url)
+                self._drain_page_queue()
+            self.retry_failed_downloads()
+        finally:
+            # Ctrl-C must still leave a usable archive and a post index.
+            self.resolve_post_links()
+            self.write_failed_attachments()
+            with open(self.output_dir / "failed_pages.json", "w", encoding="utf-8") as f:
+                json.dump(sorted(self.failed_pages), f, ensure_ascii=False, indent=2)
+            log.info("Pages still failing: %d (failed_pages.json)", len(self.failed_pages))
+            self._export_json()
+
+        log.info(
+            "Crawl complete. Pages saved: %d, Files downloaded: %d, "
+            "Downloads still failing: %d",
+            self.pages_saved,
+            len(self.downloaded_files),
+            len(self.failed_downloads),
+        )
+
+    def _drain_page_queue(self) -> None:
         while self.queue:
             if self.max_pages and self.pages_saved >= self.max_pages:
                 log.info("Reached max_pages limit (%d), stopping.", self.max_pages)
@@ -1217,18 +1290,6 @@ class ForumParser:
 
             self.save_page(norm)
 
-        self.retry_failed_downloads()
-        self.resolve_post_links()
-        self.write_failed_attachments()
-
-        log.info(
-            "Crawl complete. Pages saved: %d, Files downloaded: %d, "
-            "Downloads still failing: %d",
-            self.pages_saved,
-            len(self.downloaded_files),
-            len(self.failed_downloads),
-        )
-        self._export_json()
 
     def retry_failed_downloads(self) -> int:
         """Re-attempt transiently-failed downloads after the crawl.
@@ -1286,21 +1347,28 @@ class ForumParser:
         for path in sorted(self.output_dir.glob("*.html")):
             with open(path, encoding="utf-8") as f:
                 html = f.read()
-            if POST_LINK_ATTR not in html:
+            if POST_LINK_ATTR not in html and "viewtopic.php" not in html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
             changed = False
-            for tag in soup.find_all(attrs={POST_LINK_ATTR: True}):
-                post_id = tag[POST_LINK_ATTR]
+            for tag in soup.find_all("a", href=True):
+                post_id = tag.get(POST_LINK_ATTR)
+                if post_id is None:
+                    parsed = urlparse(urljoin(BASE_URL + "/", tag["href"]))
+                    if (parsed.netloc not in ("visio.getbb.ru", "www.visio.getbb.ru")
+                            or parsed.path != "/viewtopic.php"):
+                        continue
+                    post_id = parse_qs(parsed.query).get("p", [None])[0]
                 page_url = index.get(post_id)
                 if page_url is None:
+                    log.debug("Post %s has no saved target yet (%s)", post_id, path.name)
                     continue
                 target = url_to_local_path(page_url, self.output_dir)
                 if target == path:
                     tag["href"] = f"#p{post_id}"
                 else:
                     tag["href"] = f"{self.make_relative(path, target)}#p{post_id}"
-                del tag[POST_LINK_ATTR]
+                tag.attrs.pop(POST_LINK_ATTR, None)
                 changed = True
                 rewritten += 1
             if changed:
