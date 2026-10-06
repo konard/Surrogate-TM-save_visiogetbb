@@ -255,6 +255,22 @@ class TestDeferredRetryPass(unittest.TestCase):
         self.assertEqual(parser.retry_queue, {})
         self.assertIn(normalize_url(url), parser.failed_downloads)
 
+    def test_each_deferred_pass_spends_only_one_attempt(self):
+        parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=2)
+        parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))
+        url = "https://visio.getbb.ru/download/file.php?id=1849"
+        with patch("parser.time.sleep"):
+            parser.download_file(url)
+            # Run just the first deferred pass and inspect the remaining budget.
+            parser.retry_passes = 1
+            parser.retry_failed_downloads()
+        self.assertEqual(parser.session.get.call_count, 2)
+        self.assertIn(normalize_url(url), parser.retry_queue)
+        with patch("parser.time.sleep"):
+            parser.retry_failed_downloads()
+        self.assertEqual(parser.session.get.call_count, ATTACHMENT_ATTEMPTS)
+        self.assertEqual(parser.retry_queue, {})
+
     def test_retry_passes_can_be_disabled(self):
         parser = ForumParser("/tmp/test_parser_output", delay=0, retry_passes=0)
         parser.session.get = MagicMock(side_effect=requests.ReadTimeout("stall"))

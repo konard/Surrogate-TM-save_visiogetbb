@@ -751,7 +751,9 @@ class ForumParser:
 
     def _attempts_now(self, norm: str) -> int:
         """Attempts to spend on this fetch, keeping some for deferred passes."""
-        reserved = self.retry_passes if norm not in self.download_attempts else 0
+        if norm in self.download_attempts:
+            return 1
+        reserved = self.retry_passes
         return max(1, min(self._attempts_left(norm), ATTACHMENT_ATTEMPTS - reserved))
 
     # ------------------------------------------------------------------
@@ -1490,7 +1492,7 @@ def main() -> None:
         type=int,
         default=RETRY_PASSES,
         help=(
-            "Deferred passes over temporarily failed downloads after the crawl "
+            "Deferred passes over temporarily failed pages and downloads after the crawl "
             f"(0 = disabled, default: {RETRY_PASSES})"
         ),
     )
