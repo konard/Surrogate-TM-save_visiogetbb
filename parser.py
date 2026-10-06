@@ -32,9 +32,8 @@ BASE_URL = "https://visio.getbb.ru"
 ATTACHMENT_ATTEMPTS = 3
 ATTACHMENT_RETRY_DELAY = 1.0
 
-# Healthy responses from getbb arrive in well under a second, so a stalled
-# request is a throttle/tarpit rather than a slow file. Waiting the old 60s
-# read timeout burned a full minute per stalled request for no benefit.
+# Bound stalled requests; a timeout alone does not distinguish server outages,
+# rate limits and network failures. The old timeout cost a minute per failure.
 CONNECT_TIMEOUT = 15.0
 READ_TIMEOUT = 20.0
 
@@ -44,6 +43,9 @@ READ_TIMEOUT = 20.0
 THROTTLE_TRIGGER = 3
 THROTTLE_BACKOFF_BASE = 5.0
 THROTTLE_BACKOFF_MAX = 30.0
+# Defer requests to an unavailable host after this many consecutive failures.
+# Each deferred pass starts a fresh, bounded set of probes.
+HOST_FAILURE_LIMIT = 6
 
 # Number of deferred passes over transiently-failed downloads after the crawl.
 RETRY_PASSES = 2
@@ -708,6 +710,7 @@ class ForumParser:
         self._download_log: logging.Logger | None = None
         self._last_request_at: float | None = None
         self._consecutive_failures = 0
+        self._host_failures: dict[str, int] = {}
         self.last_failure_transient = False
         self.last_attempts_used = 0
 
@@ -763,6 +766,11 @@ class ForumParser:
         """
         self.last_failure_transient = False
         self.last_attempts_used = 0
+        host = urlparse(url).netloc.lower()
+        if self._host_failures.get(host, 0) >= HOST_FAILURE_LIMIT:
+            self.last_failure_transient = True
+            log.debug("Deferring %s: host is temporarily unavailable", url)
+            return None
 
         for attempt in range(1, attempts + 1):
             try:
@@ -777,6 +785,7 @@ class ForumParser:
                 )
                 self._last_request_at = time.monotonic()
                 resp.raise_for_status()
+                self._host_failures[host] = 0
                 self._consecutive_failures = 0
                 self.last_attempts_used = attempt
                 return resp
@@ -792,8 +801,16 @@ class ForumParser:
                     log.warning("Failed to fetch %s (permanent): %s", url, e)
                     return None
 
-                self._consecutive_failures += 1
+                self._host_failures[host] = self._host_failures.get(host, 0) + 1
+                self._consecutive_failures = self._host_failures[host]
                 self._cool_down_if_throttled()
+                if self._consecutive_failures >= HOST_FAILURE_LIMIT:
+                    log.warning(
+                        "Host %s failed %d consecutive requests; deferring further "
+                        "requests until the next retry pass (use --resume later)",
+                        host, self._consecutive_failures,
+                    )
+                    return None
 
                 if attempt == attempts:
                     log.warning(
@@ -821,11 +838,11 @@ class ForumParser:
         """Pause after a run of transient failures so a rate limit can expire."""
         if self._consecutive_failures < THROTTLE_TRIGGER:
             return
-        overshoot = self._consecutive_failures - THROTTLE_TRIGGER
+        overshoot = min(self._consecutive_failures - THROTTLE_TRIGGER, 3)
         pause = min(THROTTLE_BACKOFF_BASE * (2**overshoot), THROTTLE_BACKOFF_MAX)
         log.warning(
             "%d consecutive request failures; backing off for %.1fs "
-            "to let the server-side throttle expire",
+            "before probing the server again",
             self._consecutive_failures,
             pause,
         )
@@ -1250,6 +1267,8 @@ class ForumParser:
                     break
                 log.info("Page retry pass %d/%d: %d page(s)", pass_no, self.retry_passes, len(pending))
                 self.session.close()
+                self._host_failures.clear()
+                self._consecutive_failures = 0
                 if RETRY_PASS_PAUSE > 0:
                     time.sleep(RETRY_PASS_PAUSE)
                 for url in pending:
@@ -1313,6 +1332,7 @@ class ForumParser:
             )
             # Start from fresh sockets and give the server a moment to recover.
             self.session.close()
+            self._host_failures.clear()
             self._consecutive_failures = 0
             if RETRY_PASS_PAUSE > 0:
                 time.sleep(RETRY_PASS_PAUSE)

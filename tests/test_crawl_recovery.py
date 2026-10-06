@@ -93,3 +93,31 @@ class TestCrawlRecovery(unittest.TestCase):
         self.assertEqual(self.parser.resolve_post_links(), 1)
         self.assertEqual(BeautifulSoup(path.read_text(), 'html.parser').a['href'],
                          'viewtopic__f=2&t=1129.html#p12277')
+
+
+class TestHostOutage(unittest.TestCase):
+    def test_outage_does_not_spend_a_timeout_on_every_queued_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parser = ForumParser(tmp, delay=0)
+            parser.session.get = MagicMock(side_effect=requests.ReadTimeout('outage'))
+            parser.queue.extend(BASE_URL + f'/viewtopic.php?t={n}' for n in range(50))
+            try:
+                with patch('parser.time.sleep'):
+                    parser.crawl(BASE_URL + '/viewtopic.php?t=100')
+                self.assertLessEqual(parser.session.get.call_count, 18)
+                self.assertEqual(len(json.loads((Path(tmp) / 'failed_pages.json').read_text())), 51)
+            finally:
+                parser._download_log_handler.close()
+
+    def test_other_host_success_does_not_clear_forum_outage(self):
+        parser = ForumParser('/tmp/test_parser_output', delay=0)
+        parser.session.get = MagicMock(side_effect=[requests.ReadTimeout('outage')] * 6
+                                      + [response('external')])
+        with patch('parser.time.sleep'):
+            for n in range(6):
+                parser.fetch(BASE_URL + f'/viewtopic.php?t={n}')
+            self.assertIsNotNone(parser.fetch('https://example.org/image.png'))
+            self.assertIsNone(parser.fetch(BASE_URL + '/viewtopic.php?t=7'))
+        self.assertTrue(parser.last_failure_transient)
+        self.assertEqual(parser.last_attempts_used, 0)
+        self.assertEqual(parser.session.get.call_count, 7)
