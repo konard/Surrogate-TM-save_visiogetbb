@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup, NavigableString
 from bs4.formatter import HTMLFormatter
 
 BASE_URL = "https://visio.getbb.ru"
+PARSER_VERSION = "2026.10.08"
 
 # Total attempts per attachment over the whole run, deferred passes included.
 ATTACHMENT_ATTEMPTS = 3
@@ -134,8 +135,8 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
         for cell in pagecontent.find_all("td"):
             links = cell.find_all("a", href=True)
             if links and all(
-                "viewtopic.php" in link["href"]
-                and parse_qs(urlparse(link["href"]).query).get("view", [""])[0]
+                (parts := _topic_link_parts(link["href"])) is not None
+                and parse_qs(parts.query).get("view", [""])[0]
                 in {"print", "previous", "next"}
                 for link in links
             ):
@@ -182,6 +183,35 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
 _PAGINATION_STEP_LABELS = {"На страницу", "Пред.", "След."}
 
 
+def _topic_link_parts(href: str):
+    """Recognize both forum URLs and local topic filenames from older archives."""
+    parsed = urlparse(urljoin(BASE_URL + "/", href))
+    if parsed.netloc not in ("visio.getbb.ru", "www.visio.getbb.ru"):
+        return None
+    if parsed.path == "/viewtopic.php":
+        return parsed
+    # Older parsers put the query in the filename and dropped post fragments.
+    name = urllib.parse.unquote(parsed.path).rsplit("/", 1)[-1]
+    match = re.fullmatch(r"viewtopic(?:__(.*))?\.html", name)
+    if match:
+        return parsed._replace(path="/viewtopic.php", query=match.group(1) or "")
+    return None
+
+
+def _post_id_from_link(href: str) -> str | None:
+    parsed = _topic_link_parts(href)
+    if parsed is not None:
+        post_id = parse_qs(parsed.query).get("p", [None])[0]
+        if post_id and post_id.isdecimal():
+            return post_id
+    # Same-page anchors are already local; external fragments are not posts here.
+    if href.startswith("#") or parsed is not None:
+        match = re.fullmatch(r"#p(\d+)", href if href.startswith("#") else "#" + parsed.fragment)
+        if match:
+            return match.group(1)
+    return None
+
+
 def _remove_pagination_step_links(pagecontent) -> None:
     """Drop the "На страницу", "Пред." and "След." links from page navigation.
 
@@ -204,10 +234,10 @@ def _label_post_permalinks(soup: BeautifulSoup) -> None:
         link = img.find_parent("a", href=True)
         if not link:
             continue
-        match = re.search(r"#(p\d+)$", link["href"])
-        if not match:
+        post_id = _post_id_from_link(link["href"])
+        if post_id is None:
             continue
-        img["alt"] = img["title"] = f"#{match.group(1)}"
+        img["alt"] = img["title"] = f"#p{post_id}"
         added = link.find_next_sibling("b")
         if added and added.string and added.string.startswith("Добавлено"):
             added.string = "\u00a0\u00a0" + added.string
@@ -228,15 +258,21 @@ def _remove_orphaned_footer_junk(soup: BeautifulSoup) -> None:
         "Нет новых сообщений",          # icon legend table
         "Перейти:",                     # jumpbox form
         "Найти:",                       # search form
-        "не можете начинать темы",       # topic permissions table
-        "не можете отвечать на сообщения",
-        "не можете добавлять вложения",
+        "можете начинать темы",       # permissions, logged in or anonymous
+        "можете отвечать на сообщения",
+        "можете редактировать свои сообщения",
+        "можете удалять свои сообщения",
+        "можете добавлять вложения",
     ]
 
     FOOTER_FORM_NAMES = {"search", "jumpbox"}
 
     def _is_footer_table(tag) -> bool:
         if tag.name != "table":
+            return False
+        # Footer signatures may also be quoted inside an actual forum post.
+        # Never remove a post table, its containing layout, or its nested tables.
+        if tag.find(class_="postbody") or tag.find_parent(class_="postbody"):
             return False
         # Check for known footer form names
         for form in tag.find_all("form"):
@@ -1179,6 +1215,7 @@ class ForumParser:
         local_path = url_to_local_path(norm, self.output_dir)
         if self.resume and local_path.exists():
             log.info("Resume: skipping already saved %s", norm)
+            self._repair_saved_chrome(local_path)
             self._enqueue_saved_links(local_path)
             self.pages_saved += 1
             return
@@ -1258,6 +1295,14 @@ class ForumParser:
     def crawl(self, start_url: str = BASE_URL) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._init_download_log()
+        settings = (
+            f"ForumArchiver {PARSER_VERSION}; script={Path(__file__).resolve()}; "
+            f"connect_timeout={self.connect_timeout:g}s; read_timeout={self.read_timeout:g}s; "
+            f"retry_passes={self.retry_passes}; attachment_attempts={ATTACHMENT_ATTEMPTS}; "
+            f"delay={self.delay:g}s; resume={self.resume}"
+        )
+        log.info(settings)
+        self._download_log.info(settings)
         start_norm = normalize_url(start_url)
         self.queue.append(start_norm)
 
@@ -1382,9 +1427,9 @@ class ForumParser:
     def resolve_post_links(self) -> int:
         """Point cross-page post links at the saved page holding the post.
 
-        Writes ``posts.json`` (post id -> topic page URL) and rewrites links
-        marked during ``process_page``. Posts that were not archived keep
-        their online URL. Returns the number of links rewritten.
+        Writes ``posts.json`` (post id -> topic page URL) and rewrites both
+        marked links and legacy local filenames. Posts that were not archived
+        keep their online URL. Returns the number of links rewritten.
         """
         index = build_post_index(self.output_dir)
         with open(self.output_dir / "posts.json", "w", encoding="utf-8") as f:
@@ -1395,27 +1440,36 @@ class ForumParser:
         for path in sorted(self.output_dir.glob("*.html")):
             with open(path, encoding="utf-8") as f:
                 html = f.read()
-            if POST_LINK_ATTR not in html and "viewtopic.php" not in html:
+            if POST_LINK_ATTR not in html and "viewtopic" not in html and "#p" not in html:
                 continue
             soup = BeautifulSoup(html, "html.parser")
+            page_post_ids = _page_post_ids(soup)
             changed = False
             for tag in soup.find_all("a", href=True):
                 post_id = tag.get(POST_LINK_ATTR)
                 if post_id is None:
-                    parsed = urlparse(urljoin(BASE_URL + "/", tag["href"]))
-                    if (parsed.netloc not in ("visio.getbb.ru", "www.visio.getbb.ru")
-                            or parsed.path != "/viewtopic.php"):
-                        continue
-                    post_id = parse_qs(parsed.query).get("p", [None])[0]
+                    post_id = _post_id_from_link(tag["href"])
+                if post_id is None:
+                    continue
                 page_url = index.get(post_id)
                 if page_url is None:
                     log.debug("Post %s has no saved target yet (%s)", post_id, path.name)
+                    # A legacy local filename without a target would be a dead link.
+                    # Keep the original forum available until the post is archived.
+                    fallback = f"{BASE_URL}/viewtopic.php?p={post_id}#p{post_id}"
+                    if tag["href"] != fallback:
+                        tag["href"] = fallback
+                        changed = True
+                        rewritten += 1
                     continue
                 target = url_to_local_path(page_url, self.output_dir)
-                if target == path:
-                    tag["href"] = f"#p{post_id}"
+                if post_id in page_post_ids:
+                    destination = f"#p{post_id}"
                 else:
-                    tag["href"] = f"{self.make_relative(path, target)}#p{post_id}"
+                    destination = f"{self.make_relative(path, target)}#p{post_id}"
+                if tag["href"] == destination and POST_LINK_ATTR not in tag.attrs:
+                    continue
+                tag["href"] = destination
                 tag.attrs.pop(POST_LINK_ATTR, None)
                 changed = True
                 rewritten += 1
@@ -1424,6 +1478,27 @@ class ForumParser:
                     f.write(soup.decode(formatter=_SpoilerSafeFormatter()))
         log.info("Resolved %d cross-page post link(s)", rewritten)
         return rewritten
+
+    def _repair_saved_chrome(self, path: Path) -> bool:
+        """Clean an existing page without fetching or rewriting local assets."""
+        html = path.read_text(encoding="utf-8")
+        soup = BeautifulSoup(_fix_self_closing_spans(html), "html.parser")
+        _remove_forum_chrome(soup)
+        repaired = soup.decode(formatter=_SpoilerSafeFormatter())
+        if repaired == html:
+            return False
+        path.write_text(repaired, encoding="utf-8")
+        log.debug("Repaired saved page chrome: %s", path)
+        return True
+
+    def repair_archive(self) -> int:
+        """Repair old headers, footers and post links entirely offline."""
+        repaired = sum(self._repair_saved_chrome(path)
+                       for path in sorted(self.output_dir.glob("*.html")))
+        self.resolve_post_links()
+        self._export_json()
+        log.info("Archive repair complete: cleaned %d page(s)", repaired)
+        return repaired
 
     # ------------------------------------------------------------------
     # JSON export
@@ -1443,6 +1518,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Archive forum visio.getbb.ru to a local static copy."
     )
+    parser.add_argument("--version", action="version", version=f"ForumArchiver {PARSER_VERSION}")
     parser.add_argument(
         "-o",
         "--output",
@@ -1502,6 +1578,11 @@ def main() -> None:
         help="Rebuild posts.json and repair quoted-post links in an existing archive without HTTP requests",
     )
     parser.add_argument(
+        "--repair-archive",
+        action="store_true",
+        help="Repair saved headers, footers and post links, then rebuild JSON without HTTP requests",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -1521,10 +1602,13 @@ def main() -> None:
         read_timeout=args.read_timeout,
         retry_passes=args.retry_passes,
     )
-    if args.resolve_post_links:
+    if args.repair_archive or args.resolve_post_links:
         if not archiver.output_dir.is_dir():
-            parser.error("--resolve-post-links requires an existing output directory")
-        archiver.resolve_post_links()
+            parser.error("offline repair requires an existing output directory")
+        if args.repair_archive:
+            archiver.repair_archive()
+        else:
+            archiver.resolve_post_links()
         return
     archiver.crawl(start_url=args.start_url)
 

@@ -2,3 +2,7 @@ issue-assets/
 ci-logs/
 experiments/pr-body.md
 __pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.playwright-mcp/

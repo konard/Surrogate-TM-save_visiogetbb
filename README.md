@@ -1,6 +1,33 @@
 # save_visiogetbb
 Архив форума
 
+## Версия из PR #18 и восстановление старого архива
+
+Пока [PR #18](https://github.com/Surrogate-TM/save_visiogetbb/pull/18) не объединён,
+исправления находятся в ветке `issue-17-82b33b413f46`, а не в `main`.
+Скачайте [parser.py из этой ветки](https://raw.githubusercontent.com/konard/Surrogate-TM-save_visiogetbb/issue-17-82b33b413f46/parser.py)
+вместо старой копии. Например, в PowerShell из каталога со скриптом:
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/konard/Surrogate-TM-save_visiogetbb/issue-17-82b33b413f46/parser.py" -OutFile parser.py
+python parser.py --version
+# ForumArchiver 2026.10.08
+python parser.py -o forum_archive --repair-archive
+python parser.py -o forum_archive --resume
+```
+
+`--repair-archive` исправляет шапки, подвал и ссылки на сообщения в уже
+сохранённых страницах без сетевых запросов, сохраняя пути к скачанным вложениям.
+Он также обновляет `posts.json` и `forum.json`. Поддерживаются старые ссылки вида
+`viewtopic__p=19537.html` без якоря. Если сообщение ещё не скачано, ссылка ведёт
+на исходный форум. Для докачки страниц после исправления используйте `--resume`;
+он также очищает уже сохранённые страницы перед продолжением обхода.
+
+При запуске в консоли и `downloads.log` выводятся версия, полный путь к
+исполняемому `parser.py`, таймауты и параметры повторов. Это позволяет обнаружить
+запуск другой копии скрипта. Лог с повторением 404 и таймаутом 60 с при запуске
+без параметров соответствует более старому или изменённому скрипту.
+
 # Использование
 ```
 # Полное архивирование (займёт много времени)
