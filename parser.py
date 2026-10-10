@@ -27,7 +27,7 @@ from bs4 import BeautifulSoup, NavigableString
 from bs4.formatter import HTMLFormatter
 
 BASE_URL = "https://visio.getbb.ru"
-PARSER_VERSION = "2026.10.08"
+PARSER_VERSION = "2026.10.10"
 
 # Total attempts per attachment over the whole run, deferred passes included.
 ATTACHMENT_ATTEMPTS = 3
@@ -114,9 +114,13 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
     """Remove navigation and form controls that are useless in a static archive."""
     from bs4 import Comment
 
-    for selector in ("#menubar", "#datebar", "p.searchbar"):
+    # "p.datetime" is the "Часовой пояс: UTC + 3 часа" line under breadcrumbs.
+    for selector in ("#menubar", "#datebar", "p.searchbar", "p.datetime"):
         for tag in soup.select(selector):
-            tag.decompose()
+            if not tag.find_parent(class_="postbody"):
+                tag.decompose()
+
+    _remove_index_footer(soup)
 
     pagecontent = soup.find(id="pagecontent")
     if pagecontent:
@@ -143,6 +147,7 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
                 cell.decompose()
 
         _remove_pagination_step_links(pagecontent)
+        _remove_post_action_icons(pagecontent)
 
     _label_post_permalinks(soup)
 
@@ -181,6 +186,49 @@ def _remove_forum_chrome(soup: BeautifulSoup) -> None:
 
 
 _PAGINATION_STEP_LABELS = {"На страницу", "Пред.", "След."}
+_INDEX_FOOTER_HEADINGS = {"Кто сегодня был на конференции", "Статистика", "Вход"}
+_POST_ACTION_ICON_RE = re.compile(
+    r"icon_(?:user_profile|contact_\w+|post_(?:quote|edit|delete|report|info))\.gif"
+)
+
+
+def _remove_index_footer(soup: BeautifulSoup) -> None:
+    """Drop the index page footer: cookie/team links, bottom breadcrumbs,
+    visitors of the day, statistics, the login form and the cron beacon."""
+    cookies = soup.find("a", string=re.compile(r"Удалить cookies"))
+    if cookies is not None:
+        block = cookies.find_parent("span") or cookies
+        # Everything after these links on the index page is dynamic footer.
+        for sibling in list(block.next_siblings):
+            sibling.extract()
+        block.decompose()
+
+    for heading in soup.find_all("h4"):
+        if heading.get_text(" ", strip=True) not in _INDEX_FOOTER_HEADINGS:
+            continue
+        table = heading.find_parent("table")
+        if table is not None and not table.find(class_="postbody") and not table.find_parent(class_="postbody"):
+            (table.find_parent("form") or table).decompose()
+    for form in soup.find_all("form"):
+        if form.find("input", attrs={"name": "password"}) and not form.find_parent(class_="postbody"):
+            form.decompose()
+    for img in soup.find_all("img", src=re.compile(r"cron\.php")):
+        img.decompose()
+
+
+def _remove_post_action_icons(pagecontent) -> None:
+    """Empty the cell under each post holding the profile/PM/quote buttons.
+
+    Those buttons lead to the online forum (profile, posting.php), so in the
+    archive they are dead icons. The cell itself stays to keep the table grid.
+    """
+    for cell in pagecontent.find_all("td"):
+        if (cell.find(class_="postbody") or cell.find("td")
+                or cell.find_parent(class_="postbody") or cell.get_text(strip=True)):
+            continue
+        images = cell.find_all("img")
+        if images and all(_POST_ACTION_ICON_RE.search(img.get("src", "")) for img in images):
+            cell.clear()
 
 
 def _topic_link_parts(href: str):
@@ -509,39 +557,49 @@ def detect_extension_from_response(response: requests.Response, url: str) -> str
     return ext
 
 
+_FORUM_LINK_RE = re.compile(r"viewforum(?:\.php|__[^/]*\.html)")
+_TOPIC_LINK_RE = re.compile(r"viewtopic(?:\.php|__[^/]*\.html)")
+
+
 def _extract_index_sections(soup: BeautifulSoup) -> list[dict]:
     """Parse forum index page: return list of top-level sections with subsections."""
     sections = []
     current_section: dict | None = None
 
-    pagecontent = soup.find(id="pagecontent")
-    if not pagecontent:
-        return sections
+    # The subsilver2 index has no #pagecontent: its forum list sits in #wrapcentre.
+    container = soup.find(id="pagecontent") or soup.find(id="wrapcentre") or soup
 
-    for row in pagecontent.find_all("tr"):
+    for row in container.find_all("tr"):
         # Section header row (cat class)
         cat = row.find("td", class_="cat")
         if cat and not row.find("td", class_=re.compile(r"^(row|forumrow)")):
             title = cat.get_text(" ", strip=True)
-            current_section = {"title": title, "subsections": []}
-            sections.append(current_section)
+            if title:
+                current_section = {"title": title, "subsections": []}
+                sections.append(current_section)
             continue
 
         if current_section is None:
             continue
 
         # Subsection row
-        forum_link = row.find("a", href=re.compile(r"viewforum\.php"))
+        forum_link = row.find("a", class_="forumlink") or row.find("a", href=_FORUM_LINK_RE)
         if forum_link:
             href = forum_link.get("href", "")
             title = forum_link.get_text(" ", strip=True)
-            desc_td = row.find("td", class_=re.compile(r"(row2|forumrow)"))
             desc = ""
-            if desc_td:
+            link_cell = forum_link.find_parent("td")
+            desc_tag = link_cell and next(
+                (tag for tag in link_cell.find_all(class_="forumdesc")
+                 if not tag.get_text(strip=True).startswith("Подфорум")),
+                None,
+            )
+            desc_td = row.find("td", class_=re.compile(r"(row2|forumrow)"))
+            if desc_tag is None and desc_td:
                 # Description is usually in a <span class="genmed"> or the td's own text
                 desc_tag = desc_td.find("span", class_="genmed") or desc_td.find("p")
-                if desc_tag:
-                    desc = desc_tag.get_text(" ", strip=True)
+            if desc_tag:
+                desc = desc_tag.get_text(" ", strip=True)
             current_section["subsections"].append({
                 "title": title,
                 "url": href,
@@ -560,7 +618,7 @@ def _extract_forum_threads(soup: BeautifulSoup) -> list[dict]:
         return threads
 
     for row in pagecontent.find_all("tr"):
-        link = row.find("a", href=re.compile(r"viewtopic\.php"))
+        link = row.find("a", class_="topictitle") or row.find("a", href=_TOPIC_LINK_RE)
         if not link:
             continue
         title = link.get_text(" ", strip=True)
@@ -568,6 +626,16 @@ def _extract_forum_threads(soup: BeautifulSoup) -> list[dict]:
         threads.append({"title": title, "url": href, "posts": []})
 
     return threads
+
+
+def _saved_page_path(href: str, output_dir: Path) -> Path:
+    """Local file for a forum URL or for a link already rewritten to the archive."""
+    href = href.split("#", 1)[0]
+    parsed = urlparse(href)
+    if not parsed.scheme and not parsed.netloc and parsed.path.endswith(".html"):
+        # '?' and '&' are part of the archive filename, not a URL query.
+        return output_dir / urllib.parse.unquote(href.removeprefix("./"))
+    return url_to_local_path(normalize_url(urljoin(BASE_URL + "/", href)), output_dir)
 
 
 def _extract_topic_posts(soup: BeautifulSoup) -> list[dict]:
@@ -664,10 +732,7 @@ def _build_forum_structure(output_dir: Path) -> dict:
     # For each subsection, find saved viewforum pages and populate threads
     for section in sections:
         for subsection in section.get("subsections", []):
-            forum_url = subsection["url"]
-            # Derive local path from URL (may have query string like f=5)
-            norm = normalize_url(urljoin(BASE_URL + "/", forum_url.lstrip("./")))
-            forum_path = url_to_local_path(norm, output_dir)
+            forum_path = _saved_page_path(subsection["url"], output_dir)
             if not forum_path.exists():
                 continue
             with open(forum_path, encoding="utf-8") as f:
@@ -675,9 +740,7 @@ def _build_forum_structure(output_dir: Path) -> dict:
             threads = _extract_forum_threads(forum_soup)
 
             for thread in threads:
-                topic_url = thread["url"]
-                t_norm = normalize_url(urljoin(BASE_URL + "/", topic_url.lstrip("./")))
-                topic_path = url_to_local_path(t_norm, output_dir)
+                topic_path = _saved_page_path(thread["url"], output_dir)
                 if topic_path.exists():
                     with open(topic_path, encoding="utf-8") as f:
                         topic_soup = BeautifulSoup(f.read(), "html.parser")
@@ -1105,8 +1168,8 @@ class ForumParser:
             if "download/file.php" in parsed.path:
                 self._note_attachment_post(abs_href, tag, norm_page)
                 local_file = self.download_file(abs_href)
-                if local_file:
-                    tag["href"] = self.make_relative(local_path, local_file)
+                # Until a later run recovers it, keep the attachment reachable online.
+                tag["href"] = self.make_relative(local_path, local_file) if local_file else abs_href
                 continue
 
             # Forum pages: rewrite to local path and enqueue
@@ -1137,8 +1200,7 @@ class ForumParser:
             if "download/file.php" in parsed_src.path:
                 self._note_attachment_post(abs_src, tag, norm_page)
                 local_file = self.download_file(abs_src)
-                if local_file:
-                    tag["src"] = self.make_relative(local_path, local_file)
+                tag["src"] = self.make_relative(local_path, local_file) if local_file else abs_src
                 continue
 
             # Download user-content images (may be external)
@@ -1171,6 +1233,8 @@ class ForumParser:
                 local_file = self.download_file(attachment_url)
                 if local_file:
                     tag["src"] = self.make_relative(local_path, local_file)
+                elif attachment_url == abs_src:
+                    tag["src"] = abs_src
 
         # --- Rewrite <link href> (CSS) ---
         for tag in soup.find_all("link", href=True):
@@ -1216,6 +1280,7 @@ class ForumParser:
         if self.resume and local_path.exists():
             log.info("Resume: skipping already saved %s", norm)
             self._repair_saved_chrome(local_path)
+            self._retry_saved_attachments(local_path)
             self._enqueue_saved_links(local_path)
             self.pages_saved += 1
             return
@@ -1255,6 +1320,51 @@ class ForumParser:
         self.pages_saved += 1
         self.failed_pages.pop(norm, None)
         log.info("Saved: %s -> %s", norm, local_path.relative_to(self.output_dir))
+
+    def _retry_saved_attachments(self, path: Path, download: bool = True) -> int:
+        """Download attachments a saved page still links to on the forum.
+
+        Pages saved during an outage keep ``download/file.php`` links; without
+        this, ``--resume`` would skip those pages and never fetch the files.
+        With ``download=False`` only dead relative links are pointed at the
+        forum. Returns the number of attachments now stored locally.
+        """
+        html = path.read_text(encoding="utf-8")
+        if "download/file.php" not in html:
+            return 0
+        soup = BeautifulSoup(html, "html.parser")
+        page_url = _local_path_to_url(path, self.output_dir)
+        recovered = 0
+        changed = False
+        for tag in soup.find_all(["a", "img", "iframe"]):
+            attr = "href" if tag.name == "a" else "src"
+            value = tag.get(attr)
+            if not value or "file.php" not in value:
+                continue
+            url = urljoin(BASE_URL + "/", value)
+            parsed = urlparse(url)
+            if tag.name == "iframe" and parsed.netloc == "view.officeapps.live.com":
+                url = parse_qs(parsed.query).get("src", [""])[0]
+                parsed = urlparse(url)
+            if (parsed.netloc not in ("visio.getbb.ru", "www.visio.getbb.ru")
+                    or "download/file.php" not in parsed.path):
+                continue
+            local_file = None
+            if download:
+                self._note_attachment_post(url, tag, page_url)
+                local_file = self.download_file(url)
+            if local_file:
+                tag[attr] = self.make_relative(path, local_file)
+                recovered += 1
+            elif urljoin(BASE_URL + "/", value) != value:
+                # Older versions left a relative link that is dead in the archive.
+                tag[attr] = url
+            else:
+                continue
+            changed = True
+        if changed:
+            path.write_text(soup.decode(formatter=_SpoilerSafeFormatter()), encoding="utf-8")
+        return recovered
 
     def _enqueue_saved_links(self, path: Path) -> None:
         """Continue discovery through cached pages, whose links are already local."""
@@ -1493,8 +1603,10 @@ class ForumParser:
 
     def repair_archive(self) -> int:
         """Repair old headers, footers and post links entirely offline."""
-        repaired = sum(self._repair_saved_chrome(path)
-                       for path in sorted(self.output_dir.glob("*.html")))
+        repaired = 0
+        for path in sorted(self.output_dir.glob("*.html")):
+            repaired += self._repair_saved_chrome(path)
+            self._retry_saved_attachments(path, download=False)
         self.resolve_post_links()
         self._export_json()
         log.info("Archive repair complete: cleaned %d page(s)", repaired)

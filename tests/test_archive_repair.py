@@ -118,13 +118,13 @@ class TestArchiveRepair(unittest.TestCase):
             self.parser.crawl()
         self.addCleanup(self.parser._download_log_handler.close)
         startup = logs.output[0]
-        self.assertIn('ForumArchiver 2026.10.08', startup)
+        self.assertIn('ForumArchiver 2026.10.10', startup)
         self.assertIn('script=', startup)
         self.assertIn('read_timeout=20s', startup)
         self.assertIn('retry_passes=2', startup)
         self.assertIn('attachment_attempts=3', startup)
         download_log = (self.output / 'downloads.log').read_text(encoding='utf-8')
-        self.assertIn('ForumArchiver 2026.10.08', download_log)
+        self.assertIn('ForumArchiver 2026.10.10', download_log)
 
     def test_version_cli_identifies_build_without_crawling(self):
         output = io.StringIO()
@@ -133,7 +133,7 @@ class TestArchiveRepair(unittest.TestCase):
                 self.assertRaises(SystemExit) as result:
             main()
         self.assertEqual(result.exception.code, 0)
-        self.assertIn('2026.10.08', output.getvalue())
+        self.assertIn('2026.10.10', output.getvalue())
 
 
 if __name__ == '__main__':
